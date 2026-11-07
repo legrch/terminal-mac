@@ -35,7 +35,10 @@ enum VirtualMachines {
             config.networkDevices = [network]
         }
         var shares: [String: VZSharedDirectory] = ["control": VZSharedDirectory(url: directory.appendingPathComponent("exchange"), readOnly: false)]
-        if let tools { shares["tools"] = VZSharedDirectory(url: tools, readOnly: true) }
+        if let tools {
+            shares["tools"] = VZSharedDirectory(url: tools, readOnly: true)
+            shares["artifacts"] = VZSharedDirectory(url: try ArtifactShareDirectory.prepare(in: directory), readOnly: true)
+        }
         let filesystem = VZVirtioFileSystemDeviceConfiguration(tag: VZVirtioFileSystemDeviceConfiguration.macOSGuestAutomountTag)
         filesystem.share = VZMultipleDirectoryShare(directories: shares)
         config.directorySharingDevices = [filesystem]

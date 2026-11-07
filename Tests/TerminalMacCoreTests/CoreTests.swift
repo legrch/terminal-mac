@@ -4,6 +4,22 @@ import Darwin
 @testable import TerminalMacCore
 
 final class CoreTests: XCTestCase {
+    func testArtifactShareIsPrivateAndRejectsAliasesAndFiles() throws {
+        let manager = FileManager.default
+        let root = manager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try manager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? manager.removeItem(at: root) }
+        let share = try ArtifactShareDirectory.prepare(in: root)
+        XCTAssertEqual(share.lastPathComponent, "artifacts")
+        XCTAssertEqual(try ArtifactShareDirectory.prepare(in: root), share)
+        try manager.removeItem(at: share)
+        try manager.createSymbolicLink(at: share, withDestinationURL: root)
+        XCTAssertThrowsError(try ArtifactShareDirectory.prepare(in: root))
+        try manager.removeItem(at: share)
+        try Data("not a directory".utf8).write(to: share)
+        XCTAssertThrowsError(try ArtifactShareDirectory.prepare(in: root))
+    }
+
     func testClipboardShortcutsUsePhysicalPositionsAndRequireOnlyCommand() {
         // The same C/V positions must work under Latin and Cyrillic input sources;
         // layout characters, Caps Lock and Fn are deliberately absent from the resolver.
