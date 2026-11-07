@@ -160,6 +160,8 @@ An interrupted or failed installation leaves its directory and `installed: false
 
 ## Text clipboard between host and guest
 
+The native VM window leaves system shortcuts such as **Cmd+Tab** with the host, so you can switch out of the VM normally.
+
 In the native VM window, **Cmd+V** pastes the host clipboard into the focused guest field;
 **Cmd+C** copies the selected guest text to the host clipboard. The guest helper must be
 running with Accessibility permission. Only plain text up to 32 KiB is supported; files,
