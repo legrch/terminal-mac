@@ -167,8 +167,10 @@ In the native VM window, **Cmd+V** pastes the host clipboard into the focused gu
 running with Accessibility permission. Only plain text up to 32 KiB is supported; files,
 images and rich formatting are not transferred. A failed or empty guest copy keeps the
 host clipboard unchanged before a host write is attempted. Paste captures the text when
-the command is received, before waiting in an input queue; Copy refuses to overwrite a
-newer host clipboard revision. Native shortcut errors beep and appear in the VM runtime log.
+the command is received, before waiting in an input queue; Copy checks the initiating
+host clipboard revision again immediately before writing. This is not an atomic
+conditional write: another process can still race that local OS operation. Native
+shortcut errors beep and appear in the VM runtime log.
 
 In the terminal viewer, **Ctrl+G**, then **V** pastes host text; **Ctrl+G**, then **C** copies
 selected guest text to the host. Command-line equivalents:
