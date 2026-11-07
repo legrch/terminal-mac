@@ -29,10 +29,12 @@ final class ClipboardMachineView: VZVirtualMachineView {
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         transfer(event) || super.performKeyEquivalent(with: event)
     }
-    private func transfer(_ event: NSEvent) -> Bool {
-        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        guard flags == .command, let key = event.charactersIgnoringModifiers?.lowercased(),
-              key == "v" || key == "c", let mailbox = clipboardMailbox else {
+    fileprivate func transfer(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags
+        guard let shortcut = ClipboardShortcut.resolve(keyCode: event.keyCode,
+            command: flags.contains(.command), control: flags.contains(.control),
+            option: flags.contains(.option), shift: flags.contains(.shift)),
+              let mailbox = clipboardMailbox else {
             return false
         }
         guard !transferring else { NSSound.beep(); return true }
@@ -40,10 +42,24 @@ final class ClipboardMachineView: VZVirtualMachineView {
         Task { @MainActor in
             defer { transferring = false }
             do {
-                if key == "v" { try await ClipboardBridge.paste(mailbox) }
+                if shortcut == .paste { try await ClipboardBridge.paste(mailbox) }
                 else { try await ClipboardBridge.copy(mailbox) }
+                stderr("Clipboard transfer completed: \(shortcut)")
             } catch { stderr("Clipboard: \(error.localizedDescription)"); NSSound.beep() }
         }
         return true
+    }
+}
+
+/// Handle physical keyboard events before Virtualization's own input routing.
+@MainActor
+final class ClipboardMachineWindow: NSWindow {
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown, let view = contentView as? ClipboardMachineView,
+           let focused = firstResponder as? NSView,
+           (focused === view || focused.isDescendant(of: view)), view.transfer(event) {
+            return
+        }
+        super.sendEvent(event)
     }
 }

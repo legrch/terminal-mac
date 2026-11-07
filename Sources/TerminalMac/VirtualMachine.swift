@@ -145,7 +145,7 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
         view.clipboardMailbox = guestMailbox
         view.virtualMachine = vm
         view.capturesSystemKeys = false
-        let window = NSWindow(contentRect: view.frame, styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
+        let window = ClipboardMachineWindow(contentRect: view.frame, styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
         window.title = "terminal-mac · \(machine.name)"
         window.contentView = view
         window.delegate = self

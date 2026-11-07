@@ -4,6 +4,18 @@ import Darwin
 @testable import TerminalMacCore
 
 final class CoreTests: XCTestCase {
+    func testClipboardShortcutsUsePhysicalPositionsAndRequireOnlyCommand() {
+        // The same C/V positions must work under Latin and Cyrillic input sources;
+        // layout characters, Caps Lock and Fn are deliberately absent from the resolver.
+        XCTAssertEqual(ClipboardShortcut.resolve(keyCode: 8, command: true), .copy)
+        XCTAssertEqual(ClipboardShortcut.resolve(keyCode: 9, command: true), .paste)
+        XCTAssertNil(ClipboardShortcut.resolve(keyCode: 9, command: false))
+        XCTAssertNil(ClipboardShortcut.resolve(keyCode: 9, command: true, shift: true))
+        XCTAssertNil(ClipboardShortcut.resolve(keyCode: 9, command: true, control: true))
+        XCTAssertNil(ClipboardShortcut.resolve(keyCode: 9, command: true, option: true))
+        XCTAssertNil(ClipboardShortcut.resolve(keyCode: 48, command: true))
+    }
+
     func testFirstRunPlansSkipDownloadAndInstallForExistingMacs() {
         let machine = Machine(name: "work", cpu: 4, memoryGiB: 4, diskGiB: 64, installed: true)
         XCTAssertEqual(SetupPlan(name: "work", machine: machine, hasLocalImage: false).steps,
