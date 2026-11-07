@@ -444,7 +444,9 @@ final class TerminalViewer {
         Task { @MainActor in
             let started = Date()
             do {
-                _ = try await mailbox.call(request)
+                if request.action == "host-paste" { try await ClipboardBridge.paste(mailbox) }
+                else if request.action == "host-copy" { try await ClipboardBridge.copy(mailbox) }
+                else { _ = try await mailbox.call(request) }
                 record(label, ok: true, milliseconds: Date().timeIntervalSince(started) * 1000)
             } catch {
                 queue.removeAll(); labels.removeAll()
@@ -472,7 +474,9 @@ final class TerminalViewer {
                 switch event {
                 case .text(let value):
                     if let shortcut = Self.shortcuts.first(where: { String($0.key) == value.lowercased() }) {
-                        enqueue("key", ["key": shortcut.chord], label: "\(shortcut.glyph) \(shortcut.label)")
+                        if shortcut.chord == "cmd+v" { enqueue("host-paste", [:], label: "Paste host text") }
+                        else if shortcut.chord == "cmd+c" { enqueue("host-copy", [:], label: "Copy to host") }
+                        else { enqueue("key", ["key": shortcut.chord], label: "\(shortcut.glyph) \(shortcut.label)") }
                     }
                     setPalette(false)
                 case .key, .mouse: setPalette(false)

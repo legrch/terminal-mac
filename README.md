@@ -158,10 +158,37 @@ VM data lives in `~/Library/Application Support/terminal-mac/machines/NAME/`. `T
 
 An interrupted or failed installation leaves its directory and `installed: false` for diagnosis. It is never silently overwritten. To retry, ensure no installer/VM is running, move that incomplete directory aside, then create the VM again. There is deliberately no destructive VM-delete command yet.
 
+## Text clipboard between host and guest
+
+In the native VM window, **Cmd+V** pastes the host clipboard into the focused guest field;
+**Cmd+C** copies the selected guest text to the host clipboard. The guest helper must be
+running with Accessibility permission. Only plain text up to 32 KiB is supported; files,
+images and rich formatting are not transferred. A failed or empty guest copy keeps the
+host clipboard unchanged. Native shortcut errors beep and appear in the VM runtime log.
+
+In the terminal viewer, **Ctrl+G**, then **V** pastes host text; **Ctrl+G**, then **C** copies
+selected guest text to the host. Command-line equivalents:
+
+```sh
+terminal-mac clipboard pilot paste
+terminal-mac clipboard pilot copy
+```
+
+Transfers happen only when requested and overwrite the destination clipboard. Clipboard
+contents are not printed by these commands. `action pilot clipboard-paste 'text'` and
+`action pilot clipboard-copy` are guest-only protocol actions; the latter returns text.
+Never use a paste into a shell unless you intend the copied text to be interpreted there.
+
+After building an updated helper, open `/Volumes/My Shared Files/tools/TerminalMacGuest.app`
+inside the guest. Existing guest macOS permission prompts may need confirmation. A VM
+runtime already running the old host executable needs a normal guest shutdown and start
+to enable native-window shortcuts; CLI transfers use the new binary immediately once the
+updated guest helper is running. Do not force-stop a guest with unsaved work.
+
 ## Isolation model
 
 - Host input and screen APIs are not used for agent actions. The helper refuses to run unless `hw.model` starts with `VirtualMac`. That check prevents accidental host execution; it is not hardware attestation or a defense against a compromised host.
-- The guest sees two explicit shares: `control` (read/write, containing request/reply JSON and screenshots) and `tools` (read-only helper app). Host home, project folders, clipboard, microphone, and camera are not attached.
+- The guest sees two explicit shares: `control` (read/write, containing request/reply JSON and screenshots) and `tools` (read-only helper app). Host home, project folders, microphone, and camera are not attached. Clipboard text crosses only on an explicit Copy/Paste action; neither clipboard is polled or mirrored.
 - There is no remote-control network listener. The flat mailbox pins its directory, rejects symlinks, hardlinks and nonregular files on reads, bounds message sizes, checks request IDs, and expires pending actions. The host never executes guest-provided content.
 - Default NAT networking permits guest internet access and may reach services on the host or local network. This is **not** a network-isolated or hardened hostile-code environment. `--offline` removes that network path.
 - A logged-out/locked guest, missing helper, denied guest permissions, or paused VM prevents normal computer use. TCC grants are interactive guest setup, not bypassed by the CLI.

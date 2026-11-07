@@ -94,6 +94,27 @@ final class GuestRuntime: NSObject {
             try GuestGuard.requireVirtualMac()
             var values: [String: String] = [:]
             switch request.action {
+            case "clipboard-paste":
+                try requireAccessibility()
+                guard let text = request.arguments["text"], text.utf8.count <= 32768 else {
+                    throw Failure("Clipboard text exceeds 32 KiB")
+                }
+                NSPasteboard.general.clearContents()
+                guard NSPasteboard.general.setString(text, forType: .string) else { throw Failure("Cannot write guest clipboard") }
+                try press("cmd+v")
+            case "clipboard-copy":
+                try requireAccessibility()
+                let before = NSPasteboard.general.changeCount
+                try press("cmd+c")
+                let deadline = Date().addingTimeInterval(2)
+                while NSPasteboard.general.changeCount == before, Date() < deadline {
+                    try await Task.sleep(nanoseconds: 20_000_000)
+                }
+                guard NSPasteboard.general.changeCount != before else { throw Failure("Nothing copied in guest; host clipboard unchanged") }
+                guard let text = NSPasteboard.general.string(forType: .string), text.utf8.count <= 32768 else {
+                    throw Failure("Guest selection is not text or exceeds 32 KiB")
+                }
+                values["text"] = text
             case "status":
                 let bounds = CGDisplayBounds(CGMainDisplayID())
                 values = ["screenRecording": String(CGPreflightScreenCaptureAccess()), "accessibility": String(AXIsProcessTrusted()),
@@ -171,6 +192,7 @@ final class GuestRuntime: NSObject {
                     // Literal text must not inherit modifiers from a preceding shortcut.
                     down.flags = []; up.flags = []
                     chunk.withUnsafeBufferPointer { ptr in down.keyboardSetUnicodeString(stringLength: ptr.count, unicodeString: ptr.baseAddress!) }
+                    down.flags = []; up.flags = []
                     down.post(tap: .cghidEventTap); up.post(tap: .cghidEventTap); chunk.removeAll(keepingCapacity: true)
                 }
                 for character in text {
@@ -219,7 +241,7 @@ final class GuestRuntime: NSObject {
         }
         for down in [true, false] {
             guard let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down) else { throw Failure("Cannot create key") }
-            event.flags = flags; event.post(tap: .cghidEventTap)
+            event.flags = down ? flags : []; event.post(tap: .cghidEventTap)
         }
     }
     static let keys: [String: CGKeyCode] = [

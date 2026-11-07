@@ -103,6 +103,7 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
     let vm: VZVirtualMachine
     let machine: Machine
     let mailbox: Mailbox
+    let guestMailbox: Mailbox
     let lock: Int32
     var window: NSWindow?
     var loop: Task<Void, Never>?
@@ -111,6 +112,7 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
 
     init(machine: Machine, directory: URL, tools: URL) throws {
         self.machine = machine
+        guestMailbox = try Mailbox(directory.appendingPathComponent("exchange"), create: true)
         lock = open(directory.appendingPathComponent("runtime.lock").path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard lock >= 0 else { throw Failure("Cannot open VM lock") }
         guard flock(lock, LOCK_EX | LOCK_NB) == 0 else { close(lock); throw Failure("VM is already running") }
@@ -139,7 +141,8 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
     func showWindow() {
         if let window { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
         NSApp.setActivationPolicy(.regular)
-        let view = VZVirtualMachineView(frame: NSRect(x: 0, y: 0, width: machine.width, height: machine.height))
+        let view = ClipboardMachineView(frame: NSRect(x: 0, y: 0, width: machine.width, height: machine.height))
+        view.clipboardMailbox = guestMailbox
         view.virtualMachine = vm
         view.capturesSystemKeys = true
         let window = NSWindow(contentRect: view.frame, styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)

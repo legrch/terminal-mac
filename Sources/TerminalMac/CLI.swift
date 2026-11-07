@@ -112,6 +112,15 @@ final class CLI {
             machine.scale = args.flags.contains("hidpi") ? 2 : 1
             try store.save(machine)
             try printJSON(["name": name, "display": "\(machine.width)×\(machine.height) points at \(machine.displayScale)x"])
+        case "clipboard":
+            guard tail.count == 2, ["copy", "paste"].contains(tail[1]) else { throw Failure("Usage: terminal-mac clipboard NAME copy|paste") }
+            let name = tail[0]
+            try validateName(name)
+            guard Self.isRunning(try store.directory(name)) else { throw Failure("VM is not running") }
+            let mailbox = try Mailbox(store.directory(name).appendingPathComponent("exchange"))
+            if tail[1] == "paste" { try await ClipboardBridge.paste(mailbox) }
+            else { try await ClipboardBridge.copy(mailbox) }
+            try printJSON(["clipboard": tail[1], "state": "done"])
         case "action": try await action(tail)
         case "mcp":
             let args = try Arguments(tail, flags: ["config"])
@@ -166,7 +175,7 @@ final class CLI {
     }
     func action(_ input: [String]) async throws {
         let args = try Arguments(input, flags: ["double"], options: ["x", "y", "x2", "y2", "dx", "dy", "text", "key", "button", "count", "output", "timeout"])
-        let actions: Set<String> = ["status", "screenshot", "snapshot", "click", "move", "drag", "scroll", "type", "key"]
+        let actions: Set<String> = ["status", "screenshot", "snapshot", "click", "move", "drag", "scroll", "type", "key", "clipboard-paste", "clipboard-copy"]
         var positions = args.positionals
         let name: String
         if let first = positions.first, actions.contains(first) { name = "default" }
@@ -177,7 +186,7 @@ final class CLI {
         let verb = positions.removeFirst()
         var parameters = args.options
         parameters.removeValue(forKey: "output"); parameters.removeValue(forKey: "timeout")
-        if verb == "type", !positions.isEmpty { parameters["text"] = positions.joined(separator: " "); positions.removeAll() }
+        if ["type", "clipboard-paste"].contains(verb), !positions.isEmpty { parameters["text"] = positions.joined(separator: " "); positions.removeAll() }
         if verb == "key", positions.count == 1 { parameters["key"] = positions.removeFirst() }
         if ["click", "move"].contains(verb), positions.count == 2 { parameters["x"] = positions.removeFirst(); parameters["y"] = positions.removeFirst() }
         if verb == "drag", positions.count == 4 {
@@ -255,6 +264,7 @@ final class CLI {
     ls                          List installed VMs as JSON
     doctor                      Check host support and bundled guest tools
 
+    clipboard NAME copy|paste    Transfer selected guest text to host, or paste host text in guest
     action [NAME] status
     action [NAME] screenshot [--output PATH]
     action [NAME] click X Y [--button right] [--double]
