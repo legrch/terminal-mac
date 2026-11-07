@@ -43,7 +43,7 @@ No macOS restore image was found in the user's Downloads/Desktop during a target
 - Hide the VM window, continue guest control, then show it again.
 - Pause/resume and graceful shutdown; confirm helper timeouts while paused or unavailable.
 - Verify forced stop and a fresh boot without disk corruption after a deliberately disposable run.
-- Verify the guest sees only the two documented shares; verify offline configuration has no guest NIC.
+- With bundled tools, verify the guest sees only `control` (read/write), `tools` (read-only), and `artifacts` (read-only). Without tools, only `control` is mounted. Verify guest artifact writes fail and offline configuration has no guest NIC.
 - Rebuild/reinstall the helper and check privacy permission behavior under ad-hoc and stable signing.
 
 No inline-terminal rendering, guest privacy grant, guest screenshot or guest input behavior should be described as live-verified until these checks are performed.
