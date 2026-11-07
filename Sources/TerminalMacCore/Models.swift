@@ -70,6 +70,9 @@ public struct Request: Codable {
     public let action: String
     public let arguments: [String: String]
     public let deadline: Date
+    public func requireLive(at now: Date = Date()) throws {
+        guard deadline > now else { throw Failure("Request expired before execution") }
+    }
     public init(action: String, arguments: [String: String] = [:], timeout: TimeInterval = 15) {
         id = UUID(); self.action = action; self.arguments = arguments; deadline = Date().addingTimeInterval(timeout)
     }

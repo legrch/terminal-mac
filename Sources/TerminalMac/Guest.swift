@@ -92,6 +92,7 @@ final class GuestRuntime: NSObject {
     func handle(_ request: Request) async {
         do {
             try GuestGuard.requireVirtualMac()
+            try request.requireLive()
             var values: [String: String] = [:]
             switch request.action {
             case "clipboard-paste":
@@ -111,10 +112,7 @@ final class GuestRuntime: NSObject {
                     try await Task.sleep(nanoseconds: 20_000_000)
                 }
                 guard NSPasteboard.general.changeCount != before else { throw Failure("Nothing copied in guest; host clipboard unchanged") }
-                guard let text = NSPasteboard.general.string(forType: .string), text.utf8.count <= 32768 else {
-                    throw Failure("Guest selection is not text or exceeds 32 KiB")
-                }
-                values["text"] = text
+                values["text"] = try ClipboardTransfer.guestCopyText(NSPasteboard.general.string(forType: .string))
             case "status":
                 let bounds = CGDisplayBounds(CGMainDisplayID())
                 values = ["screenRecording": String(CGPreflightScreenCaptureAccess()), "accessibility": String(AXIsProcessTrusted()),

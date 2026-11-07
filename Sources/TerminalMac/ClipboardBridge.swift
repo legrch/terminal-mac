@@ -5,15 +5,22 @@ import TerminalMacCore
 /// Explicit text transfers only; never polls or mirrors either clipboard.
 @MainActor
 enum ClipboardBridge {
-    static func paste(_ mailbox: Mailbox) async throws {
-        guard let text = NSPasteboard.general.string(forType: .string), text.utf8.count <= 32768 else {
-            throw Failure("Host clipboard must contain text up to 32 KiB")
-        }
-        _ = try await mailbox.call(Request(action: "clipboard-paste", arguments: ["text": text], timeout: 5))
+    static func pasteRequest() throws -> Request {
+        let revision = NSPasteboard.general.changeCount
+        let text = NSPasteboard.general.string(forType: .string)
+        return try ClipboardTransfer.pasteRequest(text, expectedRevision: revision,
+                                                  currentRevision: NSPasteboard.general.changeCount)
     }
-    static func copy(_ mailbox: Mailbox) async throws {
-        let reply = try await mailbox.call(Request(action: "clipboard-copy", timeout: 5))
-        guard let text = reply.values["text"], text.utf8.count <= 32768 else { throw Failure("Invalid guest clipboard reply") }
+    static func paste(_ mailbox: Mailbox) async throws {
+        let request = try pasteRequest()
+        _ = try await mailbox.call(request)
+    }
+    static func copy(_ mailbox: Mailbox, request: Request? = nil, expectedHostRevision: Int? = nil) async throws {
+        let revision = expectedHostRevision ?? NSPasteboard.general.changeCount
+        let transfer = request ?? Request(action: "clipboard-copy", timeout: 5)
+        let reply = try await mailbox.call(transfer)
+        let text = try ClipboardTransfer.copyText(reply.values["text"], expectedRevision: revision,
+                                                  currentRevision: NSPasteboard.general.changeCount)
         NSPasteboard.general.clearContents()
         guard NSPasteboard.general.setString(text, forType: .string) else { throw Failure("Cannot write host clipboard") }
     }
@@ -38,12 +45,19 @@ final class ClipboardMachineView: VZVirtualMachineView {
             return false
         }
         guard !transferring else { NSSound.beep(); return true }
+        let request: Request?
+        do {
+            request = shortcut == .paste ? try ClipboardBridge.pasteRequest() :
+                shortcut == .pasteGuest ? Request(action: "key", arguments: ["key": "cmd+v"], timeout: 5) : nil
+        } catch { stderr("Clipboard: \(error.localizedDescription)"); NSSound.beep(); return true }
+        let revision = NSPasteboard.general.changeCount
+        let copyRequest = shortcut == .copy ? Request(action: "clipboard-copy", timeout: 5) : nil
         transferring = true
         Task { @MainActor in
             defer { transferring = false }
             do {
-                if shortcut == .paste { try await ClipboardBridge.paste(mailbox) }
-                else { try await ClipboardBridge.copy(mailbox) }
+                if let request { _ = try await mailbox.call(request) }
+                else { try await ClipboardBridge.copy(mailbox, request: copyRequest, expectedHostRevision: revision) }
                 stderr("Clipboard transfer completed: \(shortcut)")
             } catch { stderr("Clipboard: \(error.localizedDescription)"); NSSound.beep() }
         }

@@ -83,6 +83,7 @@ public final class Mailbox {
     }
     public func respond(_ reply: Reply) throws { try write(JSONEncoder().encode(reply), named: "reply-\(reply.id.uuidString).json") }
     public func call(_ request: Request) async throws -> Reply {
+        try request.requireLive()
         let requestName = "request-\(request.id.uuidString).json"
         let replyName = "reply-\(request.id.uuidString).json"
         defer { remove(requestName); remove(replyName) }

@@ -27,6 +27,7 @@ final class TerminalViewer {
         Shortcut(key: "n", label: "New window", chord: "cmd+n", glyph: "⌘N"), Shortcut(key: "w", label: "Close window", chord: "cmd+w", glyph: "⌘W"),
         Shortcut(key: "q", label: "Quit app", chord: "cmd+q", glyph: "⌘Q"), Shortcut(key: "f", label: "Find", chord: "cmd+f", glyph: "⌘F"),
         Shortcut(key: "c", label: "Copy", chord: "cmd+c", glyph: "⌘C"), Shortcut(key: "v", label: "Paste", chord: "cmd+v", glyph: "⌘V"),
+        Shortcut(key: "p", label: "Paste guest clipboard", chord: "guest-paste", glyph: "⌃⌘V"),
         Shortcut(key: "x", label: "Cut", chord: "cmd+x", glyph: "⌘X"), Shortcut(key: "a", label: "Select all", chord: "cmd+a", glyph: "⌘A"),
         Shortcut(key: "z", label: "Undo", chord: "cmd+z", glyph: "⌘Z"), Shortcut(key: ",", label: "Settings", chord: "cmd+,", glyph: "⌘,")
     ]
@@ -432,8 +433,11 @@ final class TerminalViewer {
             labels[last.id] = nil; labels[merged.id] = Self.typeLabel(text)
             queue[queue.count - 1] = merged; return
         }
-        guard queue.count < 64 else { record("Input is busy; wait a moment", ok: false); return }
         let request = Request(action: action, arguments: arguments, timeout: 5)
+        enqueue(request, label: label)
+    }
+    private func enqueue(_ request: Request, label: String) {
+        guard queue.count < 64 else { record("Input is busy; wait a moment", ok: false); return }
         labels[request.id] = label
         queue.append(request)
     }
@@ -444,8 +448,11 @@ final class TerminalViewer {
         Task { @MainActor in
             let started = Date()
             do {
-                if request.action == "host-paste" { try await ClipboardBridge.paste(mailbox) }
-                else if request.action == "host-copy" { try await ClipboardBridge.copy(mailbox) }
+                try request.requireLive()
+                if request.action == "clipboard-copy" {
+                    guard let revision = request.arguments["hostRevision"].flatMap(Int.init) else { throw Failure("Missing clipboard ownership") }
+                    try await ClipboardBridge.copy(mailbox, request: request, expectedHostRevision: revision)
+                }
                 else { _ = try await mailbox.call(request) }
                 record(label, ok: true, milliseconds: Date().timeIntervalSince(started) * 1000)
             } catch {
@@ -474,8 +481,12 @@ final class TerminalViewer {
                 switch event {
                 case .text(let value):
                     if let shortcut = Self.shortcuts.first(where: { String($0.key) == value.lowercased() }) {
-                        if shortcut.chord == "cmd+v" { enqueue("host-paste", [:], label: "Paste host text") }
-                        else if shortcut.chord == "cmd+c" { enqueue("host-copy", [:], label: "Copy to host") }
+                        if shortcut.chord == "cmd+v" {
+                            do { enqueue(try ClipboardBridge.pasteRequest(), label: "Paste host text") }
+                            catch { record(error.localizedDescription, ok: false) }
+                        }
+                        else if shortcut.chord == "cmd+c" { enqueue("clipboard-copy", ["hostRevision": String(NSPasteboard.general.changeCount)], label: "Copy to host") }
+                        else if shortcut.chord == "guest-paste" { enqueue("key", ["key": "cmd+v"], label: "Paste guest clipboard") }
                         else { enqueue("key", ["key": shortcut.chord], label: "\(shortcut.glyph) \(shortcut.label)") }
                     }
                     setPalette(false)
