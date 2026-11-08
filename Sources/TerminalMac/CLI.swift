@@ -294,6 +294,9 @@ final class CLI {
     stop [NAME] [--force]        Request guest shutdown (or immediately power off)
     ls                          List installed VMs as JSON
     doctor                      Check host support and bundled guest tools
+    rename OLD NEW              Rename a stopped VM, preserving identity and guest data
+    clone OLD NEW               Clone a stopped VM into an independent instance with a fresh identity
+    lease NAME status           Report which client currently owns guest input
 
     clipboard NAME copy|paste    Transfer selected guest text to host, or paste host text in guest
     action --vm NAME status
