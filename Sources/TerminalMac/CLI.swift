@@ -119,6 +119,11 @@ final class CLI {
             let status = try JSONSerialization.data(withJSONObject: holder.map { ["held": true, "owner": $0] } ?? ["held": false, "owner": NSNull()],
                                                     options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
             print(String(decoding: status, as: UTF8.self))
+        case "rename":
+            let args = try Arguments(tail)
+            guard args.positionals.count == 2 else { throw Failure("Usage: terminal-mac rename OLD NEW") }
+            try store.rename(args.positionals[0], to: args.positionals[1])
+            try printJSON(["from": args.positionals[0], "to": args.positionals[1], "state": "RENAMED"])
         case "display":
             let args = try Arguments(tail, flags: ["hidpi", "standard"])
             let name = try args.machineName()

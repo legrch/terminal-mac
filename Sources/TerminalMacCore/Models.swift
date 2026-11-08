@@ -144,4 +144,54 @@ public struct Store {
         let data = try JSONEncoder().encode(machine)
         try data.write(to: directory(machine.name).appendingPathComponent("machine.json"), options: .atomic)
     }
+
+    /// Same-volume directory rename that preserves identity, disks, auxiliary state and guest
+    /// data. Refuses running machines, held input leases and collisions; the directory move is
+    /// atomic, metadata completes before the receipt is published, and an interrupted state is
+    /// detected instead of silently adopted. Historical evidence inside the machine directory
+    /// moves unchanged; the receipt records the old→new mapping.
+    public func rename(_ from: String, to: String) throws {
+        try validateName(from)
+        try validateName(to)
+        guard from != to else { throw Failure("Renaming '\(from)' to itself changes nothing") }
+        let source = try directory(from)
+        guard FileManager.default.fileExists(atPath: source.appendingPathComponent("machine.json").path) else {
+            throw Failure("VM '\(from)' does not exist")
+        }
+        let destination = try directory(to)
+        guard !FileManager.default.fileExists(atPath: destination.path) else {
+            throw Failure("VM '\(to)' already exists; rename refuses collisions")
+        }
+        let lock = open(source.appendingPathComponent("runtime.lock").path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard lock >= 0 else { throw Failure("Cannot verify '\(from)' is stopped") }
+        var running = false
+        if flock(lock, LOCK_EX | LOCK_NB) == 0 { flock(lock, LOCK_UN) } else { running = true }
+        close(lock)
+        guard !running else { throw Failure("VM '\(from)' is running. Stop it with: terminal-mac stop \(from)") }
+        if let holder = InputLease.holder(directory: source) {
+            throw Failure("Guest input is locked by \(holder); wait for it to finish before renaming")
+        }
+        guard Darwin.rename(source.path, destination.path) == 0 else {
+            throw Failure("Cannot rename machine directory: \(String(cString: strerror(errno)))")
+        }
+        try Self.completeRename(destination: destination, from: from, to: to)
+    }
+
+    /// Metadata completion for a directory that has already moved. Interrupted states surface
+    /// here with their recovery instead of being adopted as a ready machine.
+    static func completeRename(destination: URL, from: String, to: String) throws {
+        var machine = try JSONDecoder().decode(Machine.self, from: Data(contentsOf: destination.appendingPathComponent("machine.json")))
+        guard machine.name == from else {
+            throw Failure("Interrupted rename: '\(destination.lastPathComponent)' still declares machine name '\(machine.name)'. Complete or undo it manually before using this machine.")
+        }
+        machine.name = to
+        let data = try JSONEncoder().encode(machine)
+        try data.write(to: destination.appendingPathComponent("machine.json"), options: .atomic)
+        let receipt: [String: Any] = ["schema": "terminal-mac.rename/1", "from": from, "to": to,
+                                      "at": Int(Date().timeIntervalSince1970)]
+        let json = try JSONSerialization.data(withJSONObject: receipt, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+        let receiptURL = destination.appendingPathComponent("rename.json")
+        try json.write(to: receiptURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: receiptURL.path)
+    }
 }
