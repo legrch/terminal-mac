@@ -1,8 +1,10 @@
 import Foundation
 import Darwin
 
-/// A request nobody answered in time. `pickedUp` is false when the request file was never even
-/// read: no helper is running, for example because the guest is still at its login screen.
+/// A request nobody answered in time. `pickedUp` is false when the request file was still
+/// visible to the caller, which usually means no helper is running — but visibility through the
+/// exchange is diagnostic only: it is not proof that no effect occurred, so timeouts never clear
+/// dependent input.
 public struct MailboxTimeout: LocalizedError {
     public let action: String
     public let pickedUp: Bool

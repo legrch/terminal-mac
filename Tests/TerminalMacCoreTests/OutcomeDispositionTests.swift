@@ -10,22 +10,23 @@ final class OutcomeDispositionTests: XCTestCase {
         XCTAssertEqual(InputQueue.disposition(for: OutcomeFailure("expired", outcome: .noEffect)), .proceed)
         XCTAssertEqual(InputQueue.disposition(for: OutcomeFailure("nothing copied", outcome: .confirmedNoCopy)), .proceed)
         XCTAssertEqual(InputQueue.disposition(for: OutcomeFailure("unknown", outcome: .mutationUnknown)), .stop)
-        XCTAssertEqual(InputQueue.disposition(for: MailboxTimeout(action: "key", pickedUp: false)), .proceed)
+        XCTAssertEqual(InputQueue.disposition(for: MailboxTimeout(action: "key", pickedUp: false)), .stop)
         XCTAssertEqual(InputQueue.disposition(for: MailboxTimeout(action: "key", pickedUp: true)), .stop)
         XCTAssertEqual(InputQueue.disposition(for: Failure("unclassified remote error")), .stop)
         XCTAssertEqual(InputQueue.disposition(for: CancellationError()), .stop)
     }
 
-    func testTimeoutBeforePickupIsKnownNoEffect() async throws {
+    func testEveryTimeoutStopsTheQueueRegardlessOfPickupVisibility() async throws {
         let mailbox = try Mailbox(temporary())
         let request = Request(action: "click", timeout: 0.05)
         do {
             _ = try await mailbox.call(request)
             XCTFail("Expected timeout")
         } catch let timeout as MailboxTimeout {
-            // The request was never read, so no guest effect can have started.
+            // pickedUp only records exchange visibility; it is not proof that no effect
+            // occurred, so a timeout stops the queue in every case.
             XCTAssertFalse(timeout.pickedUp)
-            XCTAssertEqual(InputQueue.disposition(for: timeout), .proceed)
+            XCTAssertEqual(InputQueue.disposition(for: timeout), .stop)
         }
         XCTAssertNil(try mailbox.read("request-\(request.id.uuidString).json"))
     }

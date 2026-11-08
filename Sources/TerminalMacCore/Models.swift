@@ -34,7 +34,9 @@ public enum InputQueueDisposition: Equatable { case proceed, stop }
 public enum InputQueue {
     public static func disposition(for error: Error) -> InputQueueDisposition {
         switch error {
-        case let timeout as MailboxTimeout: return timeout.pickedUp ? .stop : .proceed
+        // A timeout is never a known outcome: even an apparently unread request does not prove
+        // absence of effects across a virtio-fs exchange, so every timeout stops the queue.
+        case is MailboxTimeout: return .stop
         case let failure as OutcomeFailure: return failure.outcome == .mutationUnknown ? .stop : .proceed
         default: return .stop
         }
