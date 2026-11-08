@@ -46,6 +46,13 @@ No macOS restore image was found in the user's Downloads/Desktop during a target
 - With bundled tools, verify the guest sees only `control` (read/write), `tools` (read-only), and `artifacts` (read-only). Without tools, only `control` is mounted. Verify guest artifact writes fail and offline configuration has no guest NIC.
 - Rebuild/reinstall the helper and check privacy permission behavior under ad-hoc and stable signing.
 
+Dated live observation (November 8, 2026, macOS 27 guest, installed tool): `vm.requestStop()`
+did not complete guest shutdown twice (stuck in "stopping" past the 60-second warning on an idle
+desktop and again on a freshly booted one); the standard Apple-menu Shut Down dialog completed a
+normal shutdown both times. One cause was leftover Terminal windows running old smoke serve
+loops. `stop --force` was never used. This observation is a receipt, not a fix; the ACPI path
+needs its own investigation before any reliability claim.
+
 Recent source additions are NOT live-qualified; each needs its own guest receipts before any live claim:
 
 - Input lease: a viewer or scenario holds `<machine>/input-lease.lock`; competing CLI actions are refused naming the holder; the holder's own `--owner` actions pass; the native window is demonstrably non-interactive for a foreign holder and interactive for the holder that opened it; the guest helper defers self-replacement while the exchange flag is fresh and resumes updates after release or expiry.
