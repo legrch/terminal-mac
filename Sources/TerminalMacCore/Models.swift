@@ -6,6 +6,41 @@ public struct Failure: LocalizedError {
     public var errorDescription: String? { message }
 }
 
+/// Who can prove what about a failed operation, classified by the side that ran it before the
+/// outcome crossed the mailbox. An absent classification (an old helper, a plain error) proves
+/// nothing and must be treated as if an effect may have happened.
+public enum GuestOutcome: String, Codable, Sendable {
+    /// Failed before any guest or host effect could start.
+    case noEffect
+    /// A clipboard copy ended without changing the host clipboard; the transfer did not happen.
+    case confirmedNoCopy
+    /// An effect may have started; nobody can prove otherwise.
+    case mutationUnknown
+}
+
+public struct OutcomeFailure: LocalizedError {
+    public let message: String
+    public let outcome: GuestOutcome
+    public init(_ message: String, outcome: GuestOutcome) { self.message = message; self.outcome = outcome }
+    public var errorDescription: String? { message }
+}
+
+/// What a failed in-flight guest action means for the input queued behind it. Known no-effect and
+/// confirmed-no-copy failures keep the queued input in order; anything unresolved stops the queue,
+/// because a later command could interleave with an effect nobody can account for. A stop never
+/// replays the failed action and never claims the guest is clean.
+public enum InputQueueDisposition: Equatable { case proceed, stop }
+
+public enum InputQueue {
+    public static func disposition(for error: Error) -> InputQueueDisposition {
+        switch error {
+        case let timeout as MailboxTimeout: return timeout.pickedUp ? .stop : .proceed
+        case let failure as OutcomeFailure: return failure.outcome == .mutationUnknown ? .stop : .proceed
+        default: return .stop
+        }
+    }
+}
+
 public struct Arguments {
     public var positionals: [String] = []
     public var options: [String: String] = [:]
@@ -71,7 +106,7 @@ public struct Request: Codable {
     public let arguments: [String: String]
     public let deadline: Date
     public func requireLive(at now: Date = Date()) throws {
-        guard deadline > now else { throw Failure("Request expired before execution") }
+        guard deadline > now else { throw OutcomeFailure("Request expired before execution", outcome: .noEffect) }
     }
     public init(action: String, arguments: [String: String] = [:], timeout: TimeInterval = 15) {
         id = UUID(); self.action = action; self.arguments = arguments; deadline = Date().addingTimeInterval(timeout)
@@ -83,8 +118,10 @@ public struct Reply: Codable {
     public let ok: Bool
     public let values: [String: String]
     public let error: String?
-    public init(id: UUID, values: [String: String] = [:], error: String? = nil) {
-        self.id = id; ok = error == nil; self.values = values; self.error = error
+    /// Set on failure replies by helpers that classify outcomes; absent means unclassified.
+    public let outcome: GuestOutcome?
+    public init(id: UUID, values: [String: String] = [:], error: String? = nil, outcome: GuestOutcome? = nil) {
+        self.id = id; ok = error == nil; self.values = values; self.error = error; self.outcome = outcome
     }
 }
 

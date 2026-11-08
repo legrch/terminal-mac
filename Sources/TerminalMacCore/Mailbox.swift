@@ -13,6 +13,13 @@ public struct MailboxTimeout: LocalizedError {
 
 /// Flat virtio-fs mailbox. No network listener, credentials, or executable guest responses.
 /// Pin the directory and reject symlinks for every exchanged file.
+///
+/// Publication is caller-owned. `call` creates an empty reply slot before posting the request and
+/// `respond` writes into that existing slot; once the caller stops waiting it removes the slot, so
+/// a late responder cannot recreate a named reply after the caller gave up or was cancelled. Screenshot
+/// artifacts follow the same rule: the caller prepares an `image-` slot and the helper publishes
+/// into it. This requires both sides of an exchange to run the same protocol version; a peer that
+/// does not manage slots fails closed with a visible error instead of falling back.
 public final class Mailbox {
     private let fd: Int32
     public init(_ url: URL, create: Bool = false) throws {
@@ -41,6 +48,36 @@ public final class Mailbox {
         }
         guard renameat(fd, temporary, fd, name) == 0 else { throw Failure("Cannot publish mailbox file") }
     }
+    /// Create an empty caller-owned publication slot. Never overwrites existing content.
+    public func prepareSlot(_ name: String) throws {
+        try check(name)
+        let out = openat(fd, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard out >= 0 else {
+            if errno == EEXIST { throw Failure("Stale mailbox slot '\(name)' already exists") }
+            throw Failure("Cannot prepare mailbox slot: \(String(cString: strerror(errno)))")
+        }
+        close(out)
+    }
+    /// Write into an existing caller-owned slot. A revoked (removed) slot refuses publication
+    /// instead of recreating the name, so no late write can resurrect a file after cleanup.
+    public func publish(_ data: Data, into name: String) throws {
+        try check(name)
+        let out = openat(fd, name, O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC)
+        guard out >= 0 else {
+            if errno == ENOENT { throw Failure("Mailbox slot '\(name)' was revoked; nothing published") }
+            throw Failure("Cannot publish mailbox file (symlinks are rejected): \(String(cString: strerror(errno)))")
+        }
+        defer { close(out) }
+        try data.withUnsafeBytes { bytes in
+            var offset = 0
+            while offset < bytes.count {
+                let count = Darwin.write(out, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+                if count < 0 && errno == EINTR { continue }
+                guard count > 0 else { throw Failure("Cannot write mailbox file") }
+                offset += count
+            }
+        }
+    }
     public func read(_ name: String, limit: Int = 1_048_576) throws -> Data? {
         try check(name)
         let input = openat(fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
@@ -62,6 +99,18 @@ public final class Mailbox {
         return data
     }
     public func remove(_ name: String) { if (try? check(name)) != nil { unlinkat(fd, name, 0) } }
+    /// Exchange residue from callers that died before their deferred cleanup outlives any legal
+    /// request deadline; legal deadlines are far below this bound, so live slots are never swept.
+    static let residueAge: TimeInterval = 300
+    /// Remove one reply or image entry if it is stale, regular-file residue. Links are unlinked
+    /// without being followed.
+    private func sweepStale(named name: String) {
+        var info = stat()
+        guard fstatat(fd, name, &info, AT_SYMLINK_NOFOLLOW) == 0, (info.st_mode & S_IFMT) == S_IFREG else { return }
+        let modified = Date(timeIntervalSince1970: Double(info.st_mtimespec.tv_sec) + Double(info.st_mtimespec.tv_nsec) / 1_000_000_000)
+        guard Date().timeIntervalSince(modified) > Self.residueAge else { return }
+        unlinkat(fd, name, 0)
+    }
     public func requests() throws -> [Request] {
         // Open a fresh description: dup() would share the directory iteration offset.
         let copy = openat(fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
@@ -72,6 +121,7 @@ public final class Mailbox {
             let name = withUnsafePointer(to: &entry.pointee.d_name) { ptr in
                 ptr.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX) + 1) { String(cString: $0) }
             }
+            if name.hasPrefix("reply-") || name.hasPrefix("image-") { sweepStale(named: name); continue }
             guard name.hasPrefix("request-"), name.hasSuffix(".json") else { continue }
             defer { remove(name) }
             guard let data = try? read(name, limit: 262144), let request = try? JSONDecoder().decode(Request.self, from: data),
@@ -81,21 +131,23 @@ public final class Mailbox {
         }
         return requests.sorted { $0.deadline < $1.deadline }
     }
-    public func respond(_ reply: Reply) throws { try write(JSONEncoder().encode(reply), named: "reply-\(reply.id.uuidString).json") }
+    public func respond(_ reply: Reply) throws { try publish(JSONEncoder().encode(reply), into: "reply-\(reply.id.uuidString).json") }
     public func call(_ request: Request) async throws -> Reply {
         try request.requireLive()
         let requestName = "request-\(request.id.uuidString).json"
         let replyName = "reply-\(request.id.uuidString).json"
         defer { remove(requestName); remove(replyName) }
+        try prepareSlot(replyName)
         try write(JSONEncoder().encode(request), named: requestName)
         // Most replies land within a few milliseconds; back off for slow actions.
         var interval: UInt64 = 2_000_000
         while Date() < request.deadline {
             try Task.checkCancellation()
-            if let data = try read(replyName) {
-                let reply = try JSONDecoder().decode(Reply.self, from: data)
+            // The slot is written in place, so intermediate bytes can be observed; wait for the
+            // complete reply instead of failing on a partial payload.
+            if let data = try read(replyName), let reply = try? JSONDecoder().decode(Reply.self, from: data) {
                 guard reply.id == request.id else { throw Failure("Mismatched reply") }
-                if !reply.ok { throw Failure(reply.error ?? "Action failed") }
+                if !reply.ok { throw OutcomeFailure(reply.error ?? "Action failed", outcome: reply.outcome ?? .mutationUnknown) }
                 return reply
             }
             try await Task.sleep(nanoseconds: interval)

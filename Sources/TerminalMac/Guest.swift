@@ -90,6 +90,9 @@ final class GuestRuntime: NSObject {
     }
     @objc func loginSettings() { SMAppService.openSystemSettingsLoginItems() }
     func handle(_ request: Request) async {
+        // Provenance for the failure reply: anything after the first guest effect must be
+        // treated as if the effect may have happened, unless a specific confirmed outcome applies.
+        var touched = false
         do {
             try GuestGuard.requireVirtualMac()
             try request.requireLive()
@@ -98,21 +101,26 @@ final class GuestRuntime: NSObject {
             case "clipboard-paste":
                 try requireAccessibility()
                 guard let text = request.arguments["text"], text.utf8.count <= 32768 else {
-                    throw Failure("Clipboard text exceeds 32 KiB")
+                    throw OutcomeFailure("Clipboard text exceeds 32 KiB", outcome: .noEffect)
                 }
                 NSPasteboard.general.clearContents()
+                touched = true
                 guard NSPasteboard.general.setString(text, forType: .string) else { throw Failure("Cannot write guest clipboard") }
                 try press("cmd+v")
             case "clipboard-copy":
                 try requireAccessibility()
                 let before = NSPasteboard.general.changeCount
                 try press("cmd+c")
+                touched = true
                 let deadline = Date().addingTimeInterval(2)
                 while NSPasteboard.general.changeCount == before, Date() < deadline {
                     try await Task.sleep(nanoseconds: 20_000_000)
                 }
-                guard NSPasteboard.general.changeCount != before else { throw Failure("Nothing copied in guest; host clipboard unchanged") }
-                values["text"] = try ClipboardTransfer.guestCopyText(NSPasteboard.general.string(forType: .string))
+                guard NSPasteboard.general.changeCount != before else {
+                    throw OutcomeFailure("Nothing copied in guest; host clipboard unchanged", outcome: .confirmedNoCopy)
+                }
+                do { values["text"] = try ClipboardTransfer.guestCopyText(NSPasteboard.general.string(forType: .string)) }
+                catch { throw OutcomeFailure(error.localizedDescription, outcome: .confirmedNoCopy) }
             case "status":
                 let bounds = CGDisplayBounds(CGMainDisplayID())
                 values = ["screenRecording": String(CGPreflightScreenCaptureAccess()), "accessibility": String(AXIsProcessTrusted()),
@@ -128,7 +136,7 @@ final class GuestRuntime: NSObject {
                 guard let frame = try await desktop.frame(after: since, timeout: wait) else { values["unchanged"] = "true"; break }
                 let encoded = try DesktopStream.encode(frame)
                 let filename = "image-\(request.id.uuidString).bin"
-                try mailbox.write(encoded.data, named: filename)
+                try mailbox.publish(encoded.data, into: filename)
                 values.merge(["image": filename, "format": "bgra-lz4", "width": String(encoded.width), "height": String(encoded.height),
                               "bytesPerRow": String(encoded.bytesPerRow), "sequence": String(frame.sequence)]) { $1 }
             case "screenshot", "snapshot":
@@ -142,18 +150,22 @@ final class GuestRuntime: NSObject {
                 let image = try await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(display: display, excludingWindows: []), configuration: config)
                 guard let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else { throw Failure("Cannot encode guest screenshot") }
                 let filename = "image-\(request.id.uuidString).png"
-                try mailbox.write(png, named: filename)
+                try mailbox.publish(png, into: filename)
                 values = ["image": filename, "width": String(image.width), "height": String(image.height)]
             case "click", "move":
                 try requireAccessibility()
                 let point = try coordinates(request)
                 let right = request.arguments["button"] == "right"
                 let button: CGMouseButton = right ? .right : .left
-                if request.action == "move" { try postMouse(.mouseMoved, point: point, button: button) }
+                if request.action == "move" {
+                    touched = true
+                    try postMouse(.mouseMoved, point: point, button: button)
+                }
                 else {
                     // `count` continues a multi-click the viewer already started, so a double click is two requests.
                     let count = try number(request, "count", fallback: 1, range: 1...3)
                     let clicks = request.arguments["double"] == "true" ? 1...2 : count...count
+                    touched = true
                     for n in clicks {
                         try postMouse(right ? .rightMouseDown : .leftMouseDown, point: point, button: button, count: n)
                         try postMouse(right ? .rightMouseUp : .leftMouseUp, point: point, button: button, count: n)
@@ -163,6 +175,7 @@ final class GuestRuntime: NSObject {
                 try requireAccessibility()
                 let start = try coordinates(request)
                 let end = try coordinates(request, x: "x2", y: "y2")
+                touched = true
                 try postMouse(.leftMouseDown, point: start, button: .left)
                 let steps = max(2, min(30, Int(hypot(end.x - start.x, end.y - start.y) / 12)))
                 for step in 1...steps {
@@ -173,14 +186,18 @@ final class GuestRuntime: NSObject {
                 try postMouse(.leftMouseUp, point: end, button: .left)
             case "scroll":
                 try requireAccessibility()
-                if request.arguments["x"] != nil { try postMouse(.mouseMoved, point: coordinates(request), button: .left) }
+                if request.arguments["x"] != nil {
+                    touched = true
+                    try postMouse(.mouseMoved, point: coordinates(request), button: .left)
+                }
                 let dy = try number(request, "dy", range: -1000...1000)
                 let dx = Int(request.arguments["dx"] ?? "0") ?? 0
                 guard (-1000...1000).contains(dx), let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: Int32(dy), wheel2: Int32(dx), wheel3: 0) else { throw Failure("Invalid scroll") }
+                touched = true
                 event.post(tap: .cghidEventTap)
             case "type":
                 try requireAccessibility()
-                guard let text = request.arguments["text"], text.utf8.count <= 32768 else { throw Failure("Provide text (maximum 32 KiB)") }
+                guard let text = request.arguments["text"], text.utf8.count <= 32768 else { throw OutcomeFailure("Provide text (maximum 32 KiB)", outcome: .noEffect) }
                 // Unicode events avoid modifying the guest or host clipboard.
                 var chunk: [UniChar] = []
                 func send() throws {
@@ -191,6 +208,7 @@ final class GuestRuntime: NSObject {
                     down.flags = []; up.flags = []
                     chunk.withUnsafeBufferPointer { ptr in down.keyboardSetUnicodeString(stringLength: ptr.count, unicodeString: ptr.baseAddress!) }
                     down.flags = []; up.flags = []
+                    touched = true
                     down.post(tap: .cghidEventTap); up.post(tap: .cghidEventTap); chunk.removeAll(keepingCapacity: true)
                 }
                 for character in text {
@@ -201,11 +219,15 @@ final class GuestRuntime: NSObject {
                 try send()
             case "key":
                 try requireAccessibility()
+                touched = true
                 try press(request.arguments["key"] ?? "")
-            default: throw Failure("Unknown guest action: \(request.action)")
+            default: throw OutcomeFailure("Unknown guest action: \(request.action)", outcome: .noEffect)
             }
             try mailbox.respond(Reply(id: request.id, values: values))
-        } catch { try? mailbox.respond(Reply(id: request.id, error: error.localizedDescription)) }
+        } catch {
+            let outcome = (error as? OutcomeFailure)?.outcome ?? (touched ? .mutationUnknown : .noEffect)
+            try? mailbox.respond(Reply(id: request.id, error: error.localizedDescription, outcome: outcome))
+        }
     }
     func requireAccessibility() throws {
         guard AXIsProcessTrusted() else { throw Failure("Allow Accessibility for TerminalMacGuest inside the VM") }

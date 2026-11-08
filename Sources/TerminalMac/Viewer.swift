@@ -164,6 +164,8 @@ final class TerminalViewer {
                                                                       "maxWidth": String(target?.imageWidth ?? 1280), "maxHeight": String(target?.imageHeight ?? 800)],
                                       timeout: link == .login ? 2 : 6)
                 defer { mailbox.remove("image-\(request.id.uuidString).bin"); mailbox.remove("image-\(request.id.uuidString).png") }
+                // Own the image slots so a late helper publish cannot recreate them after cleanup.
+                for suffix in ["bin", "png"] { try? mailbox.prepareSlot("image-\(request.id.uuidString).\(suffix)") }
                 do {
                     let reply = try await mailbox.call(request)
                     if quit { break }
@@ -450,14 +452,22 @@ final class TerminalViewer {
             do {
                 try request.requireLive()
                 if request.action == "clipboard-copy" {
-                    guard let revision = request.arguments["hostRevision"].flatMap(Int.init) else { throw Failure("Missing clipboard ownership") }
+                    guard let revision = request.arguments["hostRevision"].flatMap(Int.init) else {
+                        throw OutcomeFailure("Missing clipboard ownership", outcome: .noEffect)
+                    }
                     try await ClipboardBridge.copy(mailbox, request: request, expectedHostRevision: revision)
                 }
                 else { _ = try await mailbox.call(request) }
                 record(label, ok: true, milliseconds: Date().timeIntervalSince(started) * 1000)
             } catch {
-                queue.removeAll(); labels.removeAll()
-                record("\(label): \(error.localizedDescription)", ok: false)
+                // A known no-effect failure keeps the queued input in its original order; an
+                // unresolved outcome stops the queue instead of guessing what the guest did.
+                if InputQueue.disposition(for: error) == .stop {
+                    queue.removeAll(); labels.removeAll()
+                    record("\(label): \(error.localizedDescription) — queued input discarded", ok: false)
+                } else {
+                    record("\(label): \(error.localizedDescription)", ok: false)
+                }
             }
             inFlight = false
         }

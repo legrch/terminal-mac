@@ -127,6 +127,7 @@ final class AgentServer {
         let request = Request(action: "screenshot", timeout: 15)
         let imageName = "image-\(request.id.uuidString).png"
         defer { mailbox.remove(imageName) }
+        try mailbox.prepareSlot(imageName)
         let reply = try await guest(request, mailbox: mailbox)
         guard reply.values["image"] == imageName, let png = try mailbox.read(imageName, limit: 64 * 1024 * 1024),
               let source = CGImageSourceCreateWithData(png as CFData, nil), let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {

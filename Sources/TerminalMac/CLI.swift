@@ -195,6 +195,7 @@ final class CLI {
         let request = Request(action: verb, arguments: parameters, timeout: Double(timeout))
         let imageName = "image-\(request.id.uuidString).png"
         defer { mailbox.remove(imageName) }
+        if verb == "screenshot" || verb == "snapshot" { try mailbox.prepareSlot(imageName) }
         let reply = try await mailbox.call(request)
         var values = reply.values
         if verb == "screenshot" || verb == "snapshot" {

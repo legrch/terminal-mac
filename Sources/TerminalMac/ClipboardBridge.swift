@@ -19,10 +19,17 @@ enum ClipboardBridge {
         let revision = expectedHostRevision ?? NSPasteboard.general.changeCount
         let transfer = request ?? Request(action: "clipboard-copy", timeout: 5)
         let reply = try await mailbox.call(transfer)
-        let text = try ClipboardTransfer.copyText(reply.values["text"], expectedRevision: revision,
+        let text: String
+        do {
+            text = try ClipboardTransfer.copyText(reply.values["text"], expectedRevision: revision,
                                                   currentRevision: NSPasteboard.general.changeCount)
+        } catch {
+            // The guest transfer ended before any host clipboard write: nothing was mutated here,
+            // and newer host contents were preserved.
+            throw OutcomeFailure(error.localizedDescription, outcome: .confirmedNoCopy)
+        }
         NSPasteboard.general.clearContents()
-        guard NSPasteboard.general.setString(text, forType: .string) else { throw Failure("Cannot write host clipboard") }
+        guard NSPasteboard.general.setString(text, forType: .string) else { throw OutcomeFailure("Cannot write host clipboard", outcome: .mutationUnknown) }
     }
 }
 
