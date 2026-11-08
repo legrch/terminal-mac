@@ -73,3 +73,14 @@ The repository is also a Claude Code plugin marketplace. `.claude-plugin/plugin.
 Releases go to `govijr/terminal-mac`. Release scripts produce local immutable artifacts and upload-ready files; they never publish. Once a download host is selected, publish the production ZIP and its checksum there; do not advertise a placeholder installation URL.
 
 Public releases are self-signed and are not uploaded to Apple. `--notarized` is optional and has not been run.
+
+## Fork releases
+
+This fork keeps `scripts/release-config.sh` defaults pointing at the upstream repository and its
+`Govijr Code Signing` identity. That is deliberate for upstream compatibility, but it means a fork
+release built without overriding `GITHUB_REPO` and `SIGNING_NAME` would bind the upstream channel
+and identity. A fork channel must set both explicitly, must pin the exact source revision it
+packages, and must never silently substitute upstream release bytes for patched ones; the guest
+helper's designated-requirement update check treats a changed signing identity as a different
+helper, so a fork identity change re-requires in-guest permission grants. No fork release workflow
+is qualified yet; until one is, source here is not evidence of an installable fork release.
