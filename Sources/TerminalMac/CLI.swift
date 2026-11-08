@@ -174,18 +174,13 @@ final class CLI {
         try await Mailbox(store.directory(name).appendingPathComponent("host-control")).call(Request(action: action, arguments: arguments, timeout: timeout))
     }
     func action(_ input: [String]) async throws {
-        let args = try Arguments(input, flags: ["double"], options: ["x", "y", "x2", "y2", "dx", "dy", "text", "key", "button", "count", "output", "timeout"])
-        let actions: Set<String> = ["status", "screenshot", "snapshot", "click", "move", "drag", "scroll", "type", "key", "clipboard-paste", "clipboard-copy"]
-        var positions = args.positionals
-        let name: String
-        if let first = positions.first, actions.contains(first) { name = "default" }
-        else { guard !positions.isEmpty else { throw Failure("Usage: terminal-mac action [NAME] screenshot|click|type|key|scroll|status") }; name = positions.removeFirst() }
-        try validateName(name)
-        _ = try store.load(name)
-        guard !positions.isEmpty, actions.contains(positions[0]) else { throw Failure("Unknown or missing guest action") }
-        let verb = positions.removeFirst()
+        let args = try Arguments(input, flags: ["double"], options: ["vm", "x", "y", "x2", "y2", "dx", "dy", "text", "key", "button", "count", "output", "timeout"])
+        let target = try GuestActionTarget(positionals: args.positionals, explicitName: args.options["vm"])
+        let name = target.name, verb = target.verb
+        var positions = target.operands
         var parameters = args.options
         parameters.removeValue(forKey: "output"); parameters.removeValue(forKey: "timeout")
+        parameters.removeValue(forKey: "vm")
         if ["type", "clipboard-paste"].contains(verb), !positions.isEmpty { parameters["text"] = positions.joined(separator: " "); positions.removeAll() }
         if verb == "key", positions.count == 1 { parameters["key"] = positions.removeFirst() }
         if ["click", "move"].contains(verb), positions.count == 2 { parameters["x"] = positions.removeFirst(); parameters["y"] = positions.removeFirst() }
@@ -195,6 +190,7 @@ final class CLI {
         guard positions.isEmpty else { throw Failure("Unexpected action arguments") }
         if args.flags.contains("double") { parameters["double"] = "true" }
         let timeout = try args.integer("timeout", default: 15, range: 1...120)
+        _ = try store.load(name)
         let mailbox = try Mailbox(store.directory(name).appendingPathComponent("exchange"))
         let request = Request(action: verb, arguments: parameters, timeout: Double(timeout))
         let imageName = "image-\(request.id.uuidString).png"
@@ -265,14 +261,17 @@ final class CLI {
     doctor                      Check host support and bundled guest tools
 
     clipboard NAME copy|paste    Transfer selected guest text to host, or paste host text in guest
-    action [NAME] status
-    action [NAME] screenshot [--output PATH]
-    action [NAME] click X Y [--button right] [--double]
-    action [NAME] move X Y
-    action [NAME] drag X Y X2 Y2
-    action [NAME] type 'text'
-    action [NAME] key cmd+space
-    action [NAME] scroll --dy -300 [--dx 0 --x 640 --y 400]
+    action --vm NAME status
+    action --vm NAME screenshot [--output PATH]
+    action --vm NAME click X Y [--button right] [--double]
+    action --vm NAME move X Y
+    action --vm NAME drag X Y X2 Y2
+    action --vm NAME type 'text'
+    action --vm NAME key cmd+space
+    action --vm NAME scroll --dy -300 [--dx 0 --x 640 --y 400]
+    action --vm NAME clipboard-copy|clipboard-paste [--text TEXT]
+      Legacy action NAME ACTION and default-target ACTION remain supported
+      when unambiguous. Verb-named VMs and verb-like text require explicit syntax.
 
     mcp [NAME]                  MCP server (stdio) with computer-use tools for agents:
                                 claude mcp add terminal-mac -- terminal-mac mcp

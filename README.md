@@ -136,6 +136,14 @@ The automounted volume is supplied by macOS virtio-fs. If it is absent, check th
 ./dist/terminal-mac action default scroll --dy -300 --x 640 --y 400
 ```
 
+Use `action --vm NAME ACTION` when selecting a VM explicitly, especially if its
+name is also an action verb. For example, `action --vm clipboard-paste status`
+reads that VM's status. The ambiguous legacy form `action clipboard-paste status`
+is rejected; it must never paste into `default`. Existing unambiguous forms such
+as `action pilot status`, `action status`, and `action type 'hello'` still work.
+For verb-like text, use `action --vm default type status` or
+`action type --text status`. Target selection never depends on which VMs exist.
+
 Commands return JSON and a nonzero exit status on failure. Screenshots return a local host PNG path. Coordinates start at the top-left and match the screenshot's dimensions; screenshots use guest display points to keep input coordinates consistent on Retina displays. `snapshot` is currently a screenshot alias, not an accessibility-tree snapshot.
 
 The agent instructions are in [docs/AGENT.md](docs/AGENT.md). No global agent settings are modified.
