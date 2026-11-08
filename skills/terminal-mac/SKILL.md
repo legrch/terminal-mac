@@ -44,7 +44,8 @@ run) owns the guest, other clients are refused before anything is sent — the e
 holder. Check who owns input with `terminal-mac lease NAME status`; do not work around a
 held lease, wait for it to finish. Long-running holders drive their own `action` calls with
 `--owner <their owner token>`. Renaming a stopped machine (identity, disks and guest data are
-preserved): `terminal-mac rename OLD NEW`.
+preserved): `terminal-mac rename OLD NEW`. Cloning a stopped machine into an INDEPENDENT
+instance with a fresh VM identity and a copy-on-write disk: `terminal-mac clone OLD NEW`.
 
 ## When to stop and ask the user
 
