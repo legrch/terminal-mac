@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public struct Failure: LocalizedError {
@@ -195,5 +196,184 @@ public struct Store {
         let receiptURL = destination.appendingPathComponent("rename.json")
         try json.write(to: receiptURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: receiptURL.path)
+    }
+
+    /// Stopped-machine clone: an independent clean instance with a fresh VM identity, duplicated
+    /// auxiliary state and a copy-on-write disk where the filesystem supports it. Refuses running
+    /// machines, held input leases and collisions; the source is never mutated and the
+    /// destination is created new or not at all. The receipt binds provenance: a COW clone's
+    /// disk bytes equal the source disk at clone time.
+    public func clone(from: String, to: String, identityData: Data) throws {
+        try validateName(from)
+        try validateName(to)
+        guard from != to else { throw Failure("Cloning '\(from)' to itself changes nothing") }
+        guard !identityData.isEmpty else { throw Failure("Clone needs a non-empty VM identity") }
+        let source = try directory(from)
+        guard FileManager.default.fileExists(atPath: source.appendingPathComponent("machine.json").path) else {
+            throw Failure("VM '\(from)' does not exist")
+        }
+        let destination = try directory(to)
+        guard !FileManager.default.fileExists(atPath: destination.path) else {
+            throw Failure("VM '\(to)' already exists; clone refuses collisions")
+        }
+        let lock = open(source.appendingPathComponent("runtime.lock").path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard lock >= 0 else { throw Failure("Cannot verify '\(from)' is stopped") }
+        var running = false
+        if flock(lock, LOCK_EX | LOCK_NB) == 0 { flock(lock, LOCK_UN) } else { running = true }
+        close(lock)
+        guard !running else { throw Failure("VM '\(from)' is running. Stop it with: terminal-mac stop \(from)") }
+        if let holder = InputLease.holder(directory: source) {
+            throw Failure("Guest input is locked by \(holder); wait for it to finish before cloning")
+        }
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        // The destination is new, so any failure removes the partial directory instead of leaving it.
+        do { try Self.copyMachine(from: from, to: to, source: source, destination: destination, identityData: identityData) }
+        catch {
+            try? FileManager.default.removeItem(at: destination)
+            throw error
+        }
+    }
+
+    static func copyMachine(from: String, to: String, source: URL, destination: URL, identityData: Data) throws {
+        // Hash the source disk first: it proves readability and binds provenance before anything is written.
+        let diskDigest = try fileDigest(source.appendingPathComponent("disk.img"))
+        try copyStateFile("disk.img", from: source, to: destination, clonable: true)
+        try copyStateFile("auxiliary.bin", from: source, to: destination, clonable: true)
+        try copyStateFile("hardware.bin", from: source, to: destination, clonable: false)
+        try copyStateFile("machine.json", from: source, to: destination, clonable: false)
+        try writeDurable(identityData, at: destination.appendingPathComponent("identity.bin"))
+        var machine = try JSONDecoder().decode(Machine.self, from: Data(contentsOf: destination.appendingPathComponent("machine.json")))
+        machine.name = to
+        try writeDurable(JSONEncoder().encode(machine), at: destination.appendingPathComponent("machine.json"))
+        let receipt: [String: Any] = ["schema": "terminal-mac.clone/1", "from": from, "to": to,
+                                      "identitySha256": sha256Hex(identityData), "diskSha256Source": diskDigest,
+                                      "at": Int(Date().timeIntervalSince1970)]
+        let json = try JSONSerialization.data(withJSONObject: receipt, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+        try writeDurable(json, at: destination.appendingPathComponent("clone.json"))
+        try syncDirectory(destination)
+    }
+
+    /// One state file. Large images prefer clonefile(2): same-volume APFS gives copy-on-write, so
+    /// the clone's bytes equal the source at clone time; anything clonefile refuses falls back to
+    /// a bounded streamed copy. Sources must be plain regular files — clonefile would happily
+    /// duplicate a whole directory tree, so a stray directory or symlink fails closed instead.
+    private static func copyStateFile(_ name: String, from source: URL, to destination: URL, clonable: Bool) throws {
+        let sourceURL = source.appendingPathComponent(name)
+        var info = stat()
+        guard lstat(sourceURL.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
+            throw Failure("Cannot copy \(name): not a regular file")
+        }
+        if clonable, Darwin.clonefile(sourceURL.path, destination.appendingPathComponent(name).path, 0) == 0 { return }
+        try streamFile(named: name, from: sourceURL, to: destination.appendingPathComponent(name))
+    }
+
+    /// 64 KiB chunks, fsync of the destination file, then a source/destination size match —
+    /// a short or truncated copy is refused, never adopted.
+    private static func streamFile(named name: String, from source: URL, to destination: URL) throws {
+        let input = open(source.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard input >= 0 else { throw Failure("Cannot copy \(name): \(String(cString: strerror(errno)))") }
+        defer { close(input) }
+        let output = open(destination.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard output >= 0 else { throw Failure("Cannot copy \(name): \(String(cString: strerror(errno)))") }
+        do {
+            var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+            try buffer.withUnsafeMutableBytes { bytes in
+                while true {
+                    let count = Darwin.read(input, bytes.baseAddress, bytes.count)
+                    if count < 0 {
+                        if errno == EINTR { continue }
+                        throw Failure("Cannot copy \(name): \(String(cString: strerror(errno)))")
+                    }
+                    guard count > 0 else { break }
+                    var offset = 0
+                    while offset < count {
+                        let written = Darwin.write(output, bytes.baseAddress!.advanced(by: offset), count - offset)
+                        if written < 0 && errno == EINTR { continue }
+                        guard written > 0 else { throw Failure("Cannot copy \(name): \(String(cString: strerror(errno)))") }
+                        offset += written
+                    }
+                }
+            }
+            guard fsync(output) == 0 else { throw Failure("Cannot copy \(name): cannot sync") }
+            var sourceInfo = stat(), destinationInfo = stat()
+            guard fstat(input, &sourceInfo) == 0, fstat(output, &destinationInfo) == 0,
+                  sourceInfo.st_size == destinationInfo.st_size else {
+                throw Failure("Cannot copy \(name): size mismatch after copy")
+            }
+        } catch {
+            close(output)
+            unlink(destination.path)
+            throw error
+        }
+        close(output)
+    }
+
+    private static func fileDigest(_ url: URL) throws -> String {
+        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw Failure("Cannot hash \(url.lastPathComponent): \(String(cString: strerror(errno)))") }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
+            throw Failure("Cannot hash \(url.lastPathComponent): not a regular file")
+        }
+        var digest = SHA256()
+        var buffer = [UInt8](repeating: 0, count: 1 << 20)
+        try buffer.withUnsafeMutableBytes { bytes in
+            while true {
+                let count = Darwin.read(fd, bytes.baseAddress, bytes.count)
+                if count < 0 {
+                    if errno == EINTR { continue }
+                    throw Failure("Cannot hash \(url.lastPathComponent): \(String(cString: strerror(errno)))")
+                }
+                guard count > 0 else { break }
+                digest.update(bufferPointer: UnsafeRawBufferPointer(start: bytes.baseAddress, count: count))
+            }
+        }
+        return digest.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Create-or-replace a small file atomically: temp file, fsync, rename, directory entry sync.
+    private static func writeDurable(_ data: Data, at url: URL) throws {
+        let temporary = url.deletingLastPathComponent().appendingPathComponent("." + UUID().uuidString + ".tmp")
+        let output = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard output >= 0 else { throw Failure("Cannot write \(url.lastPathComponent): \(String(cString: strerror(errno)))") }
+        do {
+            try writeAll(output, data, name: url.lastPathComponent)
+            guard fsync(output) == 0 else { throw Failure("Cannot sync \(url.lastPathComponent)") }
+        } catch {
+            close(output)
+            unlink(temporary.path)
+            throw error
+        }
+        close(output)
+        guard Darwin.rename(temporary.path, url.path) == 0 else {
+            unlink(temporary.path)
+            throw Failure("Cannot publish \(url.lastPathComponent)")
+        }
+        try syncDirectory(url.deletingLastPathComponent())
+    }
+
+    private static func writeAll(_ fd: Int32, _ data: Data, name: String) throws {
+        try data.withUnsafeBytes { bytes in
+            var offset = 0
+            while offset < bytes.count {
+                let count = Darwin.write(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+                if count < 0 && errno == EINTR { continue }
+                guard count > 0 else { throw Failure("Cannot write \(name)") }
+                offset += count
+            }
+        }
+    }
+
+    private static func syncDirectory(_ directory: URL) throws {
+        let fd = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw Failure("Cannot sync directory: \(String(cString: strerror(errno)))") }
+        let synced = fsync(fd)
+        close(fd)
+        guard synced == 0 else { throw Failure("Cannot sync directory: \(String(cString: strerror(errno)))") }
+    }
+
+    private static func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 }

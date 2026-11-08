@@ -124,6 +124,12 @@ final class CLI {
             guard args.positionals.count == 2 else { throw Failure("Usage: terminal-mac rename OLD NEW") }
             try store.rename(args.positionals[0], to: args.positionals[1])
             try printJSON(["from": args.positionals[0], "to": args.positionals[1], "state": "RENAMED"])
+        case "clone":
+            let args = try Arguments(tail)
+            guard args.positionals.count == 2 else { throw Failure("Usage: terminal-mac clone OLD NEW") }
+            let identity = VZMacMachineIdentifier().dataRepresentation
+            try store.clone(from: args.positionals[0], to: args.positionals[1], identityData: identity)
+            try printJSON(["from": args.positionals[0], "to": args.positionals[1], "state": "CLONED"])
         case "display":
             let args = try Arguments(tail, flags: ["hidpi", "standard"])
             let name = try args.machineName()
