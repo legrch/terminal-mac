@@ -71,7 +71,12 @@ final class GuestRuntime: NSObject {
                     }
                 } catch { stderr(error.localizedDescription) }
                 desktop.stopIfIdle()
-                if Date().timeIntervalSince(lastUpdateCheck) > 30 { lastUpdateCheck = Date(); GuestBootstrap.updateFromSharedTools(tools) }
+                if Date().timeIntervalSince(lastUpdateCheck) > 30 {
+                    lastUpdateCheck = Date()
+                    // A scenario that owns guest input may be mid-run; never replace the helper
+                    // beneath it. The flag expires on its own if a holder crashed.
+                    if mailbox.leaseFlagHolder() == nil { GuestBootstrap.updateFromSharedTools(tools) }
+                }
                 // Poll quickly while a viewer or agent is active, and gently when idle.
                 try? await Task.sleep(nanoseconds: Date().timeIntervalSince(lastRequest) < 3 ? 3_000_000 : 40_000_000)
             }

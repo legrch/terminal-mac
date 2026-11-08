@@ -132,6 +132,29 @@ public final class Mailbox {
         return requests.sorted { $0.deadline < $1.deadline }
     }
     public func respond(_ reply: Reply) throws { try publish(JSONEncoder().encode(reply), into: "reply-\(reply.id.uuidString).json") }
+
+    /// Guest-input lease flag written into the exchange by the lease holder. The guest helper
+    /// reads it to defer self-replacement while a scenario owns input; the flock lease remains
+    /// the host-side authority. An unreadable or expired flag fences nothing.
+    public struct LeaseFlag: Codable, Equatable {
+        public let schema: String
+        public let owner: String
+        public let deadline: Double
+    }
+    public static let leaseFlagName = ".input-lease.json"
+    public static let leaseFlagSchema = "terminal-mac.input-lease-flag/1"
+    public func publishLeaseFlag(owner: String, ttl: TimeInterval, now: Date = Date()) throws {
+        try write(JSONEncoder().encode(LeaseFlag(schema: Self.leaseFlagSchema, owner: owner,
+                                                 deadline: now.addingTimeInterval(ttl).timeIntervalSince1970)),
+                  named: Self.leaseFlagName)
+    }
+    public func leaseFlagHolder(now: Date = Date()) -> String? {
+        guard let data = try? read(Self.leaseFlagName, limit: 4096),
+              let flag = try? JSONDecoder().decode(LeaseFlag.self, from: data),
+              flag.schema == Self.leaseFlagSchema, flag.deadline > now.timeIntervalSince1970 else { return nil }
+        return flag.owner
+    }
+    public func clearLeaseFlag() { remove(Self.leaseFlagName) }
     public func call(_ request: Request) async throws -> Reply {
         try request.requireLive()
         let requestName = "request-\(request.id.uuidString).json"

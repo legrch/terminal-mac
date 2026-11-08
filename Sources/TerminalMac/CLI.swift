@@ -95,14 +95,30 @@ final class CLI {
             // Keep the app event loop and runtime alive until guest shutdown.
             while true { try await Task.sleep(nanoseconds: 1_000_000_000) }
         case "status", "show", "hide", "pause", "resume", "stop":
-            let args = try Arguments(tail, flags: command == "stop" ? ["force"] : [])
+            let args = try Arguments(tail, flags: command == "stop" ? ["force"] : [], options: ["owner"])
             let name = try args.machineName()
             _ = try store.load(name)
             if command == "status", !runtimeIsLocked(try store.directory(name)) {
                 try printJSON(["name": name, "state": "stopped"]); return
             }
-            let reply = try await host(name, action: command, arguments: ["force": String(args.flags.contains("force"))])
+            var lifecycle = ["force": String(args.flags.contains("force"))]
+            // The lease holder that deliberately shows the login window stays interactive in it.
+            if let owner = args.options["owner"] { lifecycle["leaseOwner"] = owner }
+            let reply = try await host(name, action: command, arguments: lifecycle)
             try printJSON(reply.values)
+        case "lease":
+            let args = try Arguments(tail)
+            guard args.positionals.count == 2, args.positionals[1] == "status" else {
+                throw Failure("Usage: terminal-mac lease NAME status. Acquisition is programmatic: long-running clients flock <machine>/input-lease.lock; `action --owner NAME` drives the guest under that lease.")
+            }
+            let name = args.positionals[0]
+            try validateName(name)
+            let directory = try store.directory(name)
+            _ = try store.load(name)
+            let holder = InputLease.holder(directory: directory)
+            let status = try JSONSerialization.data(withJSONObject: holder.map { ["held": true, "owner": $0] } ?? ["held": false, "owner": NSNull()],
+                                                    options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+            print(String(decoding: status, as: UTF8.self))
         case "display":
             let args = try Arguments(tail, flags: ["hidpi", "standard"])
             let name = try args.machineName()
@@ -174,13 +190,13 @@ final class CLI {
         try await Mailbox(store.directory(name).appendingPathComponent("host-control")).call(Request(action: action, arguments: arguments, timeout: timeout))
     }
     func action(_ input: [String]) async throws {
-        let args = try Arguments(input, flags: ["double"], options: ["vm", "x", "y", "x2", "y2", "dx", "dy", "text", "key", "button", "count", "output", "timeout"])
+        let args = try Arguments(input, flags: ["double"], options: ["vm", "x", "y", "x2", "y2", "dx", "dy", "text", "key", "button", "count", "output", "timeout", "owner"])
         let target = try GuestActionTarget(positionals: args.positionals, explicitName: args.options["vm"])
         let name = target.name, verb = target.verb
         var positions = target.operands
         var parameters = args.options
         parameters.removeValue(forKey: "output"); parameters.removeValue(forKey: "timeout")
-        parameters.removeValue(forKey: "vm")
+        parameters.removeValue(forKey: "vm"); parameters.removeValue(forKey: "owner")
         if ["type", "clipboard-paste"].contains(verb), !positions.isEmpty { parameters["text"] = positions.joined(separator: " "); positions.removeAll() }
         if verb == "key", positions.count == 1 { parameters["key"] = positions.removeFirst() }
         if ["click", "move"].contains(verb), positions.count == 2 { parameters["x"] = positions.removeFirst(); parameters["y"] = positions.removeFirst() }
@@ -191,7 +207,14 @@ final class CLI {
         if args.flags.contains("double") { parameters["double"] = "true" }
         let timeout = try args.integer("timeout", default: 15, range: 1...120)
         _ = try store.load(name)
-        let mailbox = try Mailbox(store.directory(name).appendingPathComponent("exchange"))
+        let directory = try store.directory(name)
+        // A scenario holding the run lease drives its own CLI actions with the same owner token;
+        // anyone else is refused before a request is written.
+        switch InputLease.admission(holder: InputLease.holder(directory: directory), claimedOwner: args.options["owner"]) {
+        case .allowed: break
+        case .locked(let holder): throw Failure("Guest input is locked by \(holder); wait for it to finish or pass --owner \(holder)")
+        }
+        let mailbox = try Mailbox(directory.appendingPathComponent("exchange"))
         let request = Request(action: verb, arguments: parameters, timeout: Double(timeout))
         let imageName = "image-\(request.id.uuidString).png"
         defer { mailbox.remove(imageName) }

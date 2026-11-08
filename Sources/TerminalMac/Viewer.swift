@@ -110,6 +110,12 @@ final class TerminalViewer {
         }
         var frames: Task<Void, Never>?
         defer { frames?.cancel() }
+        // The viewer owns guest input while it runs: other CLI/MCP/scenario clients are refused
+        // until it exits, and the guest helper defers self-replacement while the flag is up.
+        let lease = try InputLease.acquire(directory: directory, owner: "viewer", generation: Int(Date().timeIntervalSince1970))
+        defer { lease.release(); mailbox.clearLeaseFlag() }
+        var lastFlagPublish = Date.distantPast
+        func refreshLeaseFlag() { if Date().timeIntervalSince(lastFlagPublish) >= 30 { lastFlagPublish = Date(); try? mailbox.publishLeaseFlag(owner: "viewer", ttl: 120) } }
         var parser = TerminalInput(), lastInput = Date(), previousSize = "", lastChrome = Date.distantPast
         let started = Date()
         while !quit {
@@ -141,6 +147,7 @@ final class TerminalViewer {
             if transportDecided, frames == nil, metrics.cellHeight != nil || Date().timeIntervalSince(started) > 0.4 { frames = streamFrames() }
             if wheel.dx != 0 || wheel.dy != 0, Date().timeIntervalSince(wheel.at) >= 0.03 { flushWheel() }
             sendNextInput()
+            refreshLeaseFlag()
             if Date().timeIntervalSince(lastChrome) >= 0.08 { lastChrome = Date(); drawChrome() }
             try await Task.sleep(nanoseconds: 4_000_000)
         }

@@ -47,6 +47,11 @@ final class AgentServer {
     ]
 
     func run() async throws {
+        // The MCP agent owns guest input while it serves; a competing viewer or scenario is
+        // refused at startup instead of interleaving guest actions.
+        let lease = try InputLease.acquire(directory: try store.directory(name), owner: "mcp",
+                                           generation: Int(Date().timeIntervalSince1970))
+        defer { lease.release() }
         for try await line in FileHandle.standardInput.bytes.lines {
             guard let data = line.data(using: .utf8), let message = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 send(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "Parse error"]]); continue
@@ -144,7 +149,11 @@ final class AgentServer {
     private func exchange() throws -> Mailbox { try Mailbox(store.directory(name).appendingPathComponent("exchange")) }
     private func guest(_ request: Request, mailbox: Mailbox? = nil) async throws -> Reply {
         try requireRunning()
-        return try await (mailbox ?? exchange()).call(request)
+        let box: Mailbox
+        if let mailbox { box = mailbox } else { box = try exchange() }
+        // Keep the guest-side helper-update deferral alive while the agent works.
+        try? box.publishLeaseFlag(owner: "mcp", ttl: 120)
+        return try await box.call(request)
     }
     /// Checked per call, so the server starts (and lists its tools) before any VM exists.
     private func requireRunning() throws {

@@ -105,6 +105,7 @@ enum VirtualMachines {
 final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate {
     let vm: VZVirtualMachine
     let machine: Machine
+    let directory: URL
     let mailbox: Mailbox
     let guestMailbox: Mailbox
     let lock: Int32
@@ -112,9 +113,13 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
     var loop: Task<Void, Never>?
     var stopping = false
     var stopDeadline: Date?
+    /// The lease owner that deliberately showed the native window, so that owner's lease keeps
+    /// the window interactive (owner sign-in); a foreign holder makes it non-interactive.
+    var windowOwner: String?
 
     init(machine: Machine, directory: URL, tools: URL) throws {
         self.machine = machine
+        self.directory = directory
         guestMailbox = try Mailbox(directory.appendingPathComponent("exchange"), create: true)
         lock = open(directory.appendingPathComponent("runtime.lock").path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard lock >= 0 else { throw Failure("Cannot open VM lock") }
@@ -148,6 +153,11 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
         view.clipboardMailbox = guestMailbox
         view.virtualMachine = vm
         view.capturesSystemKeys = false
+        view.inputGate = { [weak self] in
+            guard let self else { return nil }
+            let holder = InputLease.holder(directory: self.directory)
+            return InputLease.nativeWindowAllowed(holder: holder, windowOwner: self.windowOwner) ? nil : holder
+        }
         let window = ClipboardMachineWindow(contentRect: view.frame, styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
         window.title = "terminal-mac · \(machine.name)"
         window.contentView = view
@@ -163,7 +173,9 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
             var values: [String: String] = [:]
             switch request.action {
             case "status": values = ["name": machine.name, "state": stateName, "pid": String(getpid())]
-            case "show": showWindow()
+            case "show":
+                windowOwner = request.arguments["leaseOwner"]
+                showWindow()
             case "hide":
                 // Hiding the app hands focus back to whatever was in front before, usually the terminal.
                 window?.orderOut(nil); NSApp.hide(nil)

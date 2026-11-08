@@ -36,14 +36,37 @@ enum ClipboardBridge {
 @MainActor
 final class ClipboardMachineView: VZVirtualMachineView {
     var clipboardMailbox: Mailbox?
+    /// Returns the foreign lease owner that currently holds guest input, or nil when native
+    /// window input is allowed. Wired by MachineRuntime so the window is demonstrably
+    /// non-interactive while a scenario owns the lease; the holder that deliberately opened the
+    /// window for owner sign-in stays interactive.
+    var inputGate: (() -> String?)?
     private var transferring = false
+    private var lastGateNotice = Date.distantPast
+    private func denied() -> Bool {
+        guard let inputGate, let holder = inputGate() else { return false }
+        if Date().timeIntervalSince(lastGateNotice) > 1 {
+            lastGateNotice = Date()
+            stderr("Guest input is locked by \(holder)")
+        }
+        NSSound.beep()
+        return true
+    }
     override func keyDown(with event: NSEvent) {
+        if denied() { return }
         if !transfer(event) { super.keyDown(with: event) }
     }
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        transfer(event) || super.performKeyEquivalent(with: event)
+        if denied() { return true }
+        return transfer(event) || super.performKeyEquivalent(with: event)
     }
+    override func mouseDown(with event: NSEvent) { if !denied() { super.mouseDown(with: event) } }
+    override func rightMouseDown(with event: NSEvent) { if !denied() { super.rightMouseDown(with: event) } }
+    override func otherMouseDown(with event: NSEvent) { if !denied() { super.otherMouseDown(with: event) } }
+    override func mouseDragged(with event: NSEvent) { if !denied() { super.mouseDragged(with: event) } }
+    override func scrollWheel(with event: NSEvent) { if !denied() { super.scrollWheel(with: event) } }
     fileprivate func transfer(_ event: NSEvent) -> Bool {
+        if denied() { return true }
         let flags = event.modifierFlags
         guard let shortcut = ClipboardShortcut.resolve(keyCode: event.keyCode,
             command: flags.contains(.command), control: flags.contains(.control),
