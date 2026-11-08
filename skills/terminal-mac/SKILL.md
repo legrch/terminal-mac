@@ -24,17 +24,27 @@ Every command prints JSON and exits nonzero on failure. `NAME` defaults to `defa
 
 ```bash
 terminal-mac status NAME                     # stopped → terminal-mac start NAME
-terminal-mac action NAME status
-terminal-mac action NAME screenshot --output /tmp/guest.png   # then view the PNG
-terminal-mac action NAME click X Y [--double] [--button right]
-terminal-mac action NAME move X Y
-terminal-mac action NAME drag X Y X2 Y2
-terminal-mac action NAME type 'literal text'
-terminal-mac action NAME key cmd+space
-terminal-mac action NAME scroll --dy -300 --x X --y Y
+terminal-mac action --vm NAME status
+terminal-mac action --vm NAME screenshot --output /tmp/guest.png   # then view the PNG
+terminal-mac action --vm NAME click X Y [--double] [--button right]
+terminal-mac action --vm NAME move X Y
+terminal-mac action --vm NAME drag X Y X2 Y2
+terminal-mac action --vm NAME type 'literal text'
+terminal-mac action --vm NAME key cmd+space
+terminal-mac action --vm NAME scroll --dy -300 --x X --y Y
 ```
 
-Text is sent as Unicode keyboard events, not through the clipboard. No shell-execution action exists.
+`action --vm NAME ACTION` is the canonical form. The legacy `action NAME ACTION` spelling still
+works while unambiguous, but fails closed when the guest action verb (or the payload after
+`--text`) could be read as a VM name — pass `--vm` instead of guessing. Text is sent as Unicode
+keyboard events, not through the clipboard. No shell-execution action exists.
+
+Guest input is exclusive. While a viewer, an MCP agent or a scenario (for example a Farol test
+run) owns the guest, other clients are refused before anything is sent — the error names the
+holder. Check who owns input with `terminal-mac lease NAME status`; do not work around a
+held lease, wait for it to finish. Long-running holders drive their own `action` calls with
+`--owner <their owner token>`. Renaming a stopped machine (identity, disks and guest data are
+preserved): `terminal-mac rename OLD NEW`.
 
 ## When to stop and ask the user
 

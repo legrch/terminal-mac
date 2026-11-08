@@ -146,6 +146,8 @@ For verb-like text, use `action --vm default type status` or
 
 Commands return JSON and a nonzero exit status on failure. Screenshots return a local host PNG path. Coordinates start at the top-left and match the screenshot's dimensions; screenshots use guest display points to keep input coordinates consistent on Retina displays. `snapshot` is currently a screenshot alias, not an accessibility-tree snapshot.
 
+Guest input is exclusive. While a viewer, an MCP agent or a product scenario owns the guest, other clients are refused before any request is written; the error names the holder, and `terminal-mac lease NAME status` reports it without blocking. Long-running holders drive their own `action` calls with `--owner <token>`. The native VM window stays interactive for the holder that deliberately opened it (owner sign-in) and is demonstrably non-interactive while a foreign holder owns input. The guest helper defers self-replacement while a scenario holds input; an unreadable or expired lease flag fences nothing — the flock remains the authority.
+
 The agent instructions are in [docs/AGENT.md](docs/AGENT.md). No global agent settings are modified.
 
 ## Lifecycle and resources
@@ -160,7 +162,7 @@ The agent instructions are in [docs/AGENT.md](docs/AGENT.md). No global agent se
 ./dist/terminal-mac stop default --force  # immediate power-off; unsaved guest work can be lost
 ```
 
-Customize a new VM with `--cpus 4 --memory 4 --disk 64 --width 1280 --height 800` (width and height are in points; add `--standard` for a 1x display). CPU, memory and disk arguments are logical CPUs, GiB and GiB respectively. `--offline` omits the guest network device; the shared-folder control channel still works, though some macOS setup workflows may require networking.
+Customize a new VM with `--cpus 4 --memory 4 --disk 64 --width 1280 --height 800` (width and height are in points; add `--standard` for a 1x display). CPU, memory and disk arguments are logical CPUs, GiB and GiB respectively. `--offline` omits the guest network device; the shared-folder control channel still works, though some macOS setup workflows may require networking. Rename a stopped machine with `terminal-mac rename OLD NEW`: one atomic same-volume move that preserves identity, disks, auxiliary storage and guest data, refuses running machines, held input leases and collisions, records the old→new mapping in `rename.json`, and detects a half-finished earlier rename instead of adopting it.
 
 VM data lives in `~/Library/Application Support/terminal-mac/machines/NAME/`. `TERMINAL_MAC_HOME` overrides the data root. Each VM has an exclusive file lock, a sparse disk, hardware identity, auxiliary boot storage, `machine.json`, a private host-control mailbox, the guest exchange directory, and `runtime.log`. A VM boot runs as a separate background process. Lifecycle commands must use the same `TERMINAL_MAC_HOME` as the process that started it.
 

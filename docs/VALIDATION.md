@@ -46,4 +46,10 @@ No macOS restore image was found in the user's Downloads/Desktop during a target
 - With bundled tools, verify the guest sees only `control` (read/write), `tools` (read-only), and `artifacts` (read-only). Without tools, only `control` is mounted. Verify guest artifact writes fail and offline configuration has no guest NIC.
 - Rebuild/reinstall the helper and check privacy permission behavior under ad-hoc and stable signing.
 
+Recent source additions are NOT live-qualified; each needs its own guest receipts before any live claim:
+
+- Input lease: a viewer or scenario holds `<machine>/input-lease.lock`; competing CLI actions are refused naming the holder; the holder's own `--owner` actions pass; the native window is demonstrably non-interactive for a foreign holder and interactive for the holder that opened it; the guest helper defers self-replacement while the exchange flag is fresh and resumes updates after release or expiry.
+- Mailbox publication: late replies cannot recreate named reply/artifact files after caller timeout or cancellation (slot refusal); residue from crashed callers is swept only after it outlives any legal deadline; typed outcomes reach the caller and unclassified old-helper errors stop dependent input.
+- Stopped rename: run/lease/collision refusals, identity/disk/guest-data preservation across `rename OLD NEW`, helper readiness after restart under the new name, and interrupted-rename detection and recovery.
+
 No inline-terminal rendering, guest privacy grant, guest screenshot or guest input behavior should be described as live-verified until these checks are performed.
