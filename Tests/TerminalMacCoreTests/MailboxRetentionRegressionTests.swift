@@ -171,6 +171,23 @@ final class MailboxRetentionRegressionTests: XCTestCase {
         XCTAssertNil(try mailbox.read(replyName), "The caller must remove only its own reply slot")
     }
 
+    func testDuplicateCallerCannotDisruptAnActiveRequest() async throws {
+        let (client, server, _) = try mailboxPair()
+        let request = Request(action: "status", timeout: 2)
+        let first = Task { try await client.call(request) }
+        let received = try await collect(server)
+
+        do {
+            _ = try await client.call(request)
+            XCTFail("A second caller cannot reuse an active request ID")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Stale mailbox slot"))
+        }
+        try server.respond(Reply(id: received.id, values: ["done": "true"]))
+        let result = try await first.value
+        XCTAssertEqual(result.values["done"], "true")
+    }
+
     func testPartialPublicationIsPolledUntilComplete() async throws {
         // A responder writes the slot in place, so intermediate bytes can be observed; the caller
         // waits for the complete reply instead of failing on a partial payload.
