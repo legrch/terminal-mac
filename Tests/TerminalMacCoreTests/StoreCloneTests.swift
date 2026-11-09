@@ -83,6 +83,19 @@ final class StoreCloneTests: XCTestCase {
         XCTAssertEqual(receipt["diskSha256Source"] as? String, digest(sourceDisk))
     }
 
+    func testOfflineCloneDoesNotChangeTheBaseOrDefaultClone() throws {
+        let (store, root) = try store()
+        try machine("farol-base-1", in: root)
+        let baseConfig = root.appendingPathComponent("machines/farol-base-1/machine.json")
+        let original = try Data(contentsOf: baseConfig)
+        try store.clone(from: "farol-base-1", to: "closed", identityData: Data("offline-identity".utf8), offline: true)
+        try store.clone(from: "farol-base-1", to: "qa", identityData: Data("qa-identity".utf8))
+        XCTAssertFalse(try store.load("closed").network)
+        XCTAssertTrue(try store.load("qa").network)
+        XCTAssertTrue(try store.load("farol-base-1").network)
+        XCTAssertEqual(try Data(contentsOf: baseConfig), original)
+    }
+
     func testCloneRefusesCollisionsMissingSourcesSelfClonesAndInvalidNames() throws {
         let (store, root) = try store()
         try machine("pilot", in: root)

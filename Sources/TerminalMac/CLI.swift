@@ -131,10 +131,11 @@ final class CLI {
             try store.rename(args.positionals[0], to: args.positionals[1])
             try printJSON(["from": args.positionals[0], "to": args.positionals[1], "state": "RENAMED"])
         case "clone":
-            let args = try Arguments(tail)
-            guard args.positionals.count == 2 else { throw Failure("Usage: terminal-mac clone OLD NEW") }
+            let args = try Arguments(tail, flags: ["offline"])
+            guard args.positionals.count == 2 else { throw Failure("Usage: terminal-mac clone OLD NEW [--offline]") }
             let identity = VZMacMachineIdentifier().dataRepresentation
-            try store.clone(from: args.positionals[0], to: args.positionals[1], identityData: identity)
+            try store.clone(from: args.positionals[0], to: args.positionals[1], identityData: identity,
+                            offline: args.flags.contains("offline"))
             try printJSON(["from": args.positionals[0], "to": args.positionals[1], "state": "CLONED"])
         case "display":
             let args = try Arguments(tail, flags: ["hidpi", "standard"])
@@ -306,7 +307,7 @@ final class CLI {
     ls                          List installed VMs as JSON
     doctor                      Check host support and bundled guest tools
     rename OLD NEW              Rename a stopped VM, preserving identity and guest data
-    clone OLD NEW               Clone a stopped VM into an independent instance with a fresh identity
+    clone OLD NEW [--offline]   Clone a stopped VM with a fresh identity; optionally disable its network
     lease NAME status           Report which client currently owns guest input
 
     clipboard NAME copy|paste    Transfer selected guest text to host, or paste host text in guest

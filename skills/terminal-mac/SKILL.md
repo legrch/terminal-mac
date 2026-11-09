@@ -46,6 +46,8 @@ held lease, wait for it to finish. Long-running holders drive their own `action`
 `--owner <their owner token>`. Renaming a stopped machine (identity, disks and guest data are
 preserved): `terminal-mac rename OLD NEW`. Cloning a stopped machine into an INDEPENDENT
 instance with a fresh VM identity and a copy-on-write disk: `terminal-mac clone OLD NEW`.
+Add `--offline` to disable the new instance's network without changing the base. This is a
+configuration choice, not evidence that a running guest's network isolation has been qualified.
 
 ## When to stop and ask the user
 

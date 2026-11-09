@@ -207,7 +207,7 @@ public struct Store {
     /// machines, held input leases and collisions; the source is never mutated and the
     /// destination is created new or not at all. The receipt binds provenance: a COW clone's
     /// disk bytes equal the source disk at clone time.
-    public func clone(from: String, to: String, identityData: Data) throws {
+    public func clone(from: String, to: String, identityData: Data, offline: Bool = false) throws {
         try validateName(from)
         try validateName(to)
         guard from != to else { throw Failure("Cloning '\(from)' to itself changes nothing") }
@@ -235,14 +235,16 @@ public struct Store {
         }
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         // The destination is new, so any failure removes the partial directory instead of leaving it.
-        do { try Self.copyMachine(from: from, to: to, source: source, destination: destination, identityData: identityData) }
+        do { try Self.copyMachine(from: from, to: to, source: source, destination: destination,
+                                  identityData: identityData, offline: offline) }
         catch {
             try? FileManager.default.removeItem(at: destination)
             throw error
         }
     }
 
-    static func copyMachine(from: String, to: String, source: URL, destination: URL, identityData: Data) throws {
+    static func copyMachine(from: String, to: String, source: URL, destination: URL,
+                            identityData: Data, offline: Bool) throws {
         // Hash the source disk first: it proves readability and binds provenance before anything is written.
         let diskDigest = try fileDigest(source.appendingPathComponent("disk.img"))
         try copyStateFile("disk.img", from: source, to: destination, clonable: true)
@@ -252,6 +254,7 @@ public struct Store {
         try writeDurable(identityData, at: destination.appendingPathComponent("identity.bin"))
         var machine = try JSONDecoder().decode(Machine.self, from: Data(contentsOf: destination.appendingPathComponent("machine.json")))
         machine.name = to
+        if offline { machine.network = false }
         try writeDurable(JSONEncoder().encode(machine), at: destination.appendingPathComponent("machine.json"))
         let receipt: [String: Any] = ["schema": "terminal-mac.clone/1", "from": from, "to": to,
                                       "identitySha256": sha256Hex(identityData), "diskSha256Source": diskDigest,
