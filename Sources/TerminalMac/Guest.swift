@@ -74,8 +74,10 @@ final class GuestRuntime: NSObject {
                 if Date().timeIntervalSince(lastUpdateCheck) > 30 {
                     lastUpdateCheck = Date()
                     // A scenario that owns guest input may be mid-run; never replace the helper
-                    // beneath it. The flag expires on its own if a holder crashed.
-                    if mailbox.leaseFlagHolder() == nil { GuestBootstrap.updateFromSharedTools(tools) }
+                    // beneath it.
+                    // An expired/invalid marker is evidence of possible crashed or unresolved
+                    // work, never proof that the host lease ended. Defer until explicit recovery.
+                    if mailbox.helperUpdateDisposition().mayUpdate { GuestBootstrap.updateFromSharedTools(tools) }
                 }
                 // Poll quickly while a viewer or agent is active, and gently when idle.
                 try? await Task.sleep(nanoseconds: Date().timeIntervalSince(lastRequest) < 3 ? 3_000_000 : 40_000_000)

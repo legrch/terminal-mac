@@ -55,7 +55,7 @@ needs its own investigation before any reliability claim.
 
 Recent source additions are NOT live-qualified; each needs its own guest receipts before any live claim:
 
-- Input lease: a viewer or scenario holds `<machine>/input-lease.lock`; competing CLI actions are refused naming the holder; the holder's own `--owner` actions pass; the native window is demonstrably non-interactive for a foreign holder and interactive for the holder that opened it; the guest helper defers self-replacement while the exchange flag is fresh and resumes updates after release or expiry.
+- Input lease: verify a viewer or scenario holds `<machine>/input-lease.lock`; competing CLI actions are refused; the holder's own `--owner` actions pass; and the native window refuses foreign input. Verify the updated guest helper defers self-replacement while a marker is present, including after expiry or when unreadable, and resumes when it is absent after a confirmed release. Installed-helper compatibility and a host–guest handshake remain unqualified.
 - Mailbox publication: late replies cannot recreate named reply/artifact files after caller timeout or cancellation (slot refusal); residue from crashed callers is swept only after it outlives any legal deadline; typed outcomes reach the caller and unclassified old-helper errors stop dependent input.
 - Stopped rename: run/lease/collision refusals, identity/disk/guest-data preservation across `rename OLD NEW`, helper readiness after restart under the new name, and interrupted-rename detection and recovery.
 

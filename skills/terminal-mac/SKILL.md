@@ -39,10 +39,12 @@ works while unambiguous, but fails closed when the guest action verb (or the pay
 `--text`) could be read as a VM name — pass `--vm` instead of guessing. Text is sent as Unicode
 keyboard events, not through the clipboard. No shell-execution action exists.
 
-Guest input is exclusive. While a viewer, an MCP agent or a scenario (for example a Farol test
+Guest input uses a cooperative lease. While a viewer, an MCP agent or a scenario (for example a Farol test
 run) owns the guest, other clients are refused before anything is sent — the error names the
-holder. Check who owns input with `terminal-mac lease NAME status`; do not work around a
-held lease, wait for it to finish. Long-running holders drive their own `action` calls with
+holder. Check input custody with `terminal-mac lease NAME status`; do not work around a
+held lease or an `unresolved-predecessor` state. `held: false` alone is not permission to
+act when `inputAllowed` is false. Reconcile unresolved evidence before proceeding, without
+automatically deleting it. Long-running holders drive their own `action` calls with
 `--owner <their owner token>`. Renaming a stopped machine (identity, disks and guest data are
 preserved): `terminal-mac rename OLD NEW`. Cloning a stopped machine into an INDEPENDENT
 instance with a fresh VM identity and a copy-on-write disk: `terminal-mac clone OLD NEW`.

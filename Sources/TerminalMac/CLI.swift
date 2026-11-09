@@ -121,6 +121,11 @@ final class CLI {
             case .free: response = ["held": false, "owner": NSNull()]
             case .held(let owner, _): response = ["held": true, "owner": owner]
             case .heldUnknown: response = ["held": true, "owner": NSNull(), "state": "holder-unknown"]
+            case .unresolved:
+                // The kernel lock is free but persistent evidence forbids new input.
+                // Preserve held's kernel-lock meaning; consumers must inspect state.
+                response = ["held": false, "owner": NSNull(), "state": "unresolved-predecessor",
+                            "inputAllowed": false]
             }
             let status = try JSONSerialization.data(withJSONObject: response,
                                                     options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
@@ -151,7 +156,11 @@ final class CLI {
             let name = tail[0]
             try validateName(name)
             let directory = try store.directory(name)
-            guard case .free = try InputLease.probe(directory: directory) else {
+            switch try InputLease.probe(directory: directory) {
+            case .free: break
+            case .unresolved:
+                throw Failure("Previous guest input operation is unresolved; reconcile retained lease evidence before clipboard transfer")
+            case .held, .heldUnknown:
                 throw Failure("Guest input is locked; use a lease-holder action or wait for its completion")
             }
             guard Self.isRunning(directory) else { throw Failure("VM is not running") }
@@ -236,6 +245,8 @@ final class CLI {
         case .allowed: break
         case .locked(let holder): throw Failure("Guest input is locked by \(holder); wait for its holder to finish")
         case .lockedUnknown: throw Failure("Guest input is locked by another client; holder identity is unavailable")
+        case .lockedUnresolved:
+            throw Failure("Previous guest input operation is unresolved; reconcile retained lease evidence before dispatch")
         }
         let mailbox = try Mailbox(directory.appendingPathComponent("exchange"))
         let request = Request(action: verb, arguments: parameters, timeout: Double(timeout))

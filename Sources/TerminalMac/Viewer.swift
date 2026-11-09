@@ -47,6 +47,9 @@ final class TerminalViewer {
     /// The guest display in points: input coordinates, and the aspect ratio to lay out.
     private var points: (width: Int, height: Int)
     private var failure: Error?
+    /// A failed/abandoned input may still have affected the guest. Keep the
+    /// update inhibitor for reconciliation instead of releasing it on exit.
+    private var guestOutcomeUnconfirmed = false
     private var quit = false, link = Link.connecting, palette = false
     private var queue: [Request] = [], labels: [UUID: String] = [:], inFlight = false
     private var anchor: (x: Int, y: Int, at: Date)?, lastClick: (x: Int, y: Int, at: Date, count: Int)?
@@ -110,11 +113,34 @@ final class TerminalViewer {
         }
         var frames: Task<Void, Never>?
         defer { frames?.cancel() }
+        // A cancelled/thrown exit may skip the normal frame-task join. Never
+        // clear the update inhibitor until this session has observed its drain.
+        var framesDrained = false
         // The viewer owns guest input while it runs: other CLI/MCP/scenario clients are refused
         // until it exits, and the guest helper defers self-replacement while the flag is up.
         let lease = try InputLease.acquire(directory: directory, owner: "viewer", generation: Int(Date().timeIntervalSince1970))
-        defer { lease.release(); mailbox.clearLeaseFlag() }
-        var lastFlagPublish = Date.distantPast
+        var markerPublished = false
+        defer {
+            // A timed-out action or unjoined frame task may outlive this terminal session.
+            // Keep BOTH custody records unless the marker release actually completes.
+            var cleanMarkerRelease = false
+            if ViewerUpdateExitGate.mayReleaseMarker(published: markerPublished,
+                                                    framesDrained: framesDrained,
+                                                    inputInFlight: inFlight,
+                                                    outcomeUnknown: guestOutcomeUnconfirmed) {
+                do {
+                    try mailbox.releaseLeaseFlag(ownedBy: "viewer")
+                    cleanMarkerRelease = true
+                } catch { /* Retain both records for reconciliation. */ }
+            }
+            lease.release(preserveMetadata: !cleanMarkerRelease)
+        }
+        // InputLease.acquire checked the predecessor marker under flock before publishing
+        // machine metadata. Re-check here to reject a concurrent out-of-contract publisher.
+        try mailbox.requireNoOutstandingUpdateMarker()
+        try mailbox.publishLeaseFlag(owner: "viewer", ttl: 120)
+        markerPublished = true
+        var lastFlagPublish = Date()
         func refreshLeaseFlag() { if Date().timeIntervalSince(lastFlagPublish) >= 30 { lastFlagPublish = Date(); try? mailbox.publishLeaseFlag(owner: "viewer", ttl: 120) } }
         var parser = TerminalInput(), lastInput = Date(), previousSize = "", lastChrome = Date.distantPast
         let started = Date()
@@ -154,6 +180,7 @@ final class TerminalViewer {
         // Let the current frame request finish so its reply and image are removed.
         quit = true
         await frames?.value
+        framesDrained = failure == nil
         if let failure { throw failure }
     }
 
@@ -470,6 +497,7 @@ final class TerminalViewer {
                 // A known no-effect failure keeps the queued input in its original order; an
                 // unresolved outcome stops the queue instead of guessing what the guest did.
                 if InputQueue.disposition(for: error) == .stop {
+                    guestOutcomeUnconfirmed = true
                     queue.removeAll(); labels.removeAll()
                     record("\(label): \(error.localizedDescription) — queued input discarded", ok: false)
                 } else {

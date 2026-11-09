@@ -149,9 +149,10 @@ public final class Mailbox {
     }
     public func respond(_ reply: Reply) throws { try publish(JSONEncoder().encode(reply), into: "reply-\(reply.id.uuidString).json") }
 
-    /// Guest-input lease flag written into the exchange by the lease holder. The guest helper
-    /// reads it to defer self-replacement while a scenario owns input; the flock lease remains
-    /// the host-side authority. An unreadable or expired flag fences nothing.
+    /// Guest-input lease flag written into the exchange by the lease holder. The guest cannot
+    /// inspect the host's flock, so this is a conservative update inhibitor, NOT custody proof.
+    /// Only a truly absent marker permits a best-effort helper update: a present, expired,
+    /// malformed or unreadable marker may represent a crashed holder or an UNKNOWN effect.
     public struct LeaseFlag: Codable, Equatable {
         public let schema: String
         public let owner: String
@@ -164,12 +165,64 @@ public final class Mailbox {
                                                  deadline: now.addingTimeInterval(ttl).timeIntervalSince1970)),
                   named: Self.leaseFlagName)
     }
+    /// The original display-only lookup. Never use nil here as permission to replace a helper:
+    /// nil includes malformed, expired and unreadable markers as well as true absence.
     public func leaseFlagHolder(now: Date = Date()) -> String? {
         guard let data = try? read(Self.leaseFlagName, limit: 4096),
               let flag = try? JSONDecoder().decode(LeaseFlag.self, from: data),
               flag.schema == Self.leaseFlagSchema, flag.deadline > now.timeIntervalSince1970 else { return nil }
         return flag.owner
     }
+    public enum HelperUpdateDisposition: Equatable {
+        case unmarked
+        case active(owner: String)
+        case stale(owner: String)
+        case unconfirmed
+        /// A helper update must never infer safety from a failed marker read.
+        public var mayUpdate: Bool { self == .unmarked }
+    }
+    /// Real guest update admission: distinguish ENOENT from every read/format error.
+    /// Expiry only changes diagnostic status; it NEVER authorizes replacement.
+    public func helperUpdateDisposition(now: Date = Date()) -> HelperUpdateDisposition {
+        let data: Data?
+        do { data = try read(Self.leaseFlagName, limit: 4096) }
+        catch { return .unconfirmed }
+        guard let data else { return .unmarked }
+        guard let marker = try? JSONDecoder().decode(LeaseFlag.self, from: data),
+              marker.schema == Self.leaseFlagSchema, !marker.owner.isEmpty,
+              marker.owner.utf8.count <= 128, marker.owner.allSatisfy({ c in
+                  c.isASCII && (c.isLetter || c.isNumber || "-_.:".contains(c))
+              }), marker.deadline.isFinite else { return .unconfirmed }
+        return marker.deadline > now.timeIntervalSince1970 ? .active(owner: marker.owner) : .stale(owner: marker.owner)
+    }
+    /// New holders must not overwrite an old/unreconciled marker after a crash.
+    /// Only an actually missing entry is a first-use/clean-release precondition.
+    public func requireNoOutstandingUpdateMarker(now: Date = Date()) throws {
+        guard helperUpdateDisposition(now: now) == .unmarked else {
+            throw Failure("Guest helper update marker remains unresolved; reconcile the previous owner before acquiring guest input")
+        }
+    }
+    /// A clean holder may clear only its own well-formed marker, including an expired
+    /// one. Missing, corrupt or foreign entries remain unchanged for reconciliation.
+    public func releaseLeaseFlag(ownedBy owner: String, now: Date = Date()) throws {
+        switch helperUpdateDisposition(now: now) {
+        case .active(let current) where current == owner,
+             .stale(let current) where current == owner:
+            // `remove` is best-effort and cannot qualify a clean custody release: its
+            // unlink failure would otherwise be silently mistaken for a removed marker.
+            guard unlinkat(fd, Self.leaseFlagName, 0) == 0 else {
+                throw Failure("Cannot remove owned helper-update marker; preserve custody evidence")
+            }
+            // A failed directory sync leaves removal durability UNKNOWN. The host holder
+            // must retain its machine metadata rather than claiming clean completion.
+            guard fsync(fd) == 0 else {
+                throw Failure("Cannot sync helper-update marker removal; preserve custody evidence")
+            }
+        default:
+            throw Failure("Guest helper update marker changed or disappeared; preserve it for reconciliation")
+        }
+    }
+    /// Legacy explicit administrative cleanup. Must never be used as a timer expiry reaction.
     public func clearLeaseFlag() { remove(Self.leaseFlagName) }
     public func call(_ request: Request) async throws -> Reply {
         try request.requireLive()

@@ -30,8 +30,8 @@ Use `terminal-mac` for work inside an already configured virtual Mac. Obtain its
 5. Capture again after each meaningful action to confirm the result.
 
 `action --vm NAME ACTION` is the canonical target form; the legacy `action NAME ACTION`
-spelling fails closed when the target could be read as an action verb. Guest input is
-exclusive: if a viewer, another agent or a scenario owns the guest, actions are refused
+spelling fails closed when the target could be read as an action verb. Guest input uses a
+cooperative lease: if a viewer, another agent or a scenario owns the guest, actions are refused
 and name the holder (`terminal-mac lease NAME status` reports it) — wait for that owner
 to finish instead of working around it.
 
@@ -39,4 +39,4 @@ All replies are JSON; failures exit nonzero. Use normal safe shell quoting for l
 
 Do not run the `guest` subcommand on the host. Do not use host screenshot or event-posting tools as a fallback. Apps, files and authenticated sessions inside the VM are separate from the user's physical Mac. Request user help for guest login, privacy permission prompts, or missing credentials.
 
-`hide` and exiting `view` leave the VM running. `stop` requests shutdown. `stop --force` can lose guest work and should be used only when a normal shutdown cannot complete. This release candidate has no reset, clone, rollback, file import, or delete command.
+`hide` and exiting `view` leave the VM running. `stop` requests shutdown. `stop --force` can lose guest work and should be used only when a normal shutdown cannot complete. Stopped machines support `rename` and `clone`; reset, rollback, file import, and delete commands are not provided.

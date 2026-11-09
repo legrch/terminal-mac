@@ -177,6 +177,8 @@ public struct Store {
             throw Failure("Guest input is locked by \(owner); wait for it to finish before renaming")
         case .heldUnknown:
             throw Failure("Guest input is locked by another client with unavailable identity; refuse renaming")
+        case .unresolved:
+            throw Failure("Previous guest input operation is unresolved; refuse renaming until retained evidence is reconciled")
         }
         guard Darwin.rename(source.path, destination.path) == 0 else {
             throw Failure("Cannot rename machine directory: \(String(cString: strerror(errno)))")
@@ -232,6 +234,8 @@ public struct Store {
             throw Failure("Guest input is locked by \(owner); wait for it to finish before cloning")
         case .heldUnknown:
             throw Failure("Guest input is locked by another client with unavailable identity; refuse cloning")
+        case .unresolved:
+            throw Failure("Previous guest input operation is unresolved; refuse cloning until retained evidence is reconciled")
         }
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         // The destination is new, so any failure removes the partial directory instead of leaving it.

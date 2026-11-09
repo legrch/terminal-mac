@@ -12,6 +12,9 @@ import UniformTypeIdentifiers
 final class AgentServer {
     let store: Store
     let name: String
+    /// Sticky for this session. A crash also leaves the original marker behind.
+    private var guestOutcomeUnconfirmed = false
+    private var guestActionInFlight = false
     init(store: Store, name: String) { self.store = store; self.name = name }
 
     static let instructions = """
@@ -51,7 +54,30 @@ final class AgentServer {
         // refused at startup instead of interleaving guest actions.
         let lease = try InputLease.acquire(directory: try store.directory(name), owner: "mcp",
                                            generation: Int(Date().timeIntervalSince1970))
-        defer { lease.release() }
+        // A long-lived MCP server may be idle longer than the 120-second marker TTL.
+        // Publish at acquisition, not only on the next tool request. The new helper
+        // treats expiry as an inhibitor; no heartbeat/timer is needed for update safety.
+        var markerPublished = false
+        let updateBox = try? Mailbox(store.directory(name).appendingPathComponent("exchange"), create: true)
+        defer {
+            var cleanMarkerRelease = false
+            if markerPublished && !guestOutcomeUnconfirmed && !guestActionInFlight, let updateBox {
+                do {
+                    try updateBox.releaseLeaseFlag(ownedBy: "mcp")
+                    cleanMarkerRelease = true
+                } catch { /* Keep both records for reconciliation. */ }
+            }
+            // Acquisition already checked predecessor metadata and the marker under flock.
+            // A failed initialization, unresolved guest effect or failed marker release must
+            // preserve this session's machine metadata too; unlock is NOT effect completion.
+            lease.release(preserveMetadata: !cleanMarkerRelease)
+        }
+        guard let updateBox else { throw Failure("Cannot open guest exchange for helper-update custody") }
+        // Defence in depth: refuse a marker newly published after acquisition. Only the
+        // pre-publication check inside InputLease.acquire protects predecessor metadata.
+        try updateBox.requireNoOutstandingUpdateMarker()
+        try updateBox.publishLeaseFlag(owner: "mcp", ttl: 120)
+        markerPublished = true
         for try await line in FileHandle.standardInput.bytes.lines {
             guard let data = line.data(using: .utf8), let message = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 send(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "Parse error"]]); continue
@@ -151,9 +177,19 @@ final class AgentServer {
         try requireRunning()
         let box: Mailbox
         if let mailbox { box = mailbox } else { box = try exchange() }
-        // Keep the guest-side helper-update deferral alive while the agent works.
-        try? box.publishLeaseFlag(owner: "mcp", ttl: 120)
-        return try await box.call(request)
+        // The session marker is already published. A timeout or unclassified
+        // failure keeps it after the MCP lease releases; no implicit retry/clear.
+        guestActionInFlight = true
+        defer { guestActionInFlight = false }
+        do { return try await box.call(request) }
+        catch {
+            if let failure = error as? OutcomeFailure,
+               failure.outcome == .noEffect || failure.outcome == .confirmedNoCopy {
+                throw error
+            }
+            guestOutcomeUnconfirmed = true
+            throw error
+        }
     }
     /// Checked per call, so the server starts (and lists its tools) before any VM exists.
     private func requireRunning() throws {

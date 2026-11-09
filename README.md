@@ -146,7 +146,15 @@ For verb-like text, use `action --vm default type status` or
 
 Commands return JSON and a nonzero exit status on failure. Screenshots return a local host PNG path. Coordinates start at the top-left and match the screenshot's dimensions; screenshots use guest display points to keep input coordinates consistent on Retina displays. `snapshot` is currently a screenshot alias, not an accessibility-tree snapshot.
 
-Guest input is exclusive. While a viewer, an MCP agent or a product scenario owns the guest, other clients are refused before any request is written; the error names the holder, and `terminal-mac lease NAME status` reports it without blocking. Long-running holders drive their own `action` calls with `--owner <token>`. The native VM window stays interactive for the holder that deliberately opened it (owner sign-in) and is demonstrably non-interactive while a foreign holder owns input. The guest helper defers self-replacement while a scenario holds input; an unreadable or expired lease flag fences nothing — the flock remains the authority.
+Guest input uses a cooperative lease. While a viewer, an MCP agent or a product scenario
+holds it, other clients are refused; a holder can use `action --owner <token>` for its own
+actions. `terminal-mac lease NAME status` also reports `state: unresolved-predecessor` and
+`inputAllowed: false` when the kernel lock is free but prior custody evidence remains. A
+`held: false` response alone does not authorize input: consumers must inspect the state.
+Retained or unreadable evidence must be reconciled, not removed automatically. The updated
+guest helper defers self-replacement while a marker exists, even after expiry. These checks
+do not authenticate the owner token or make a probe and action atomic; older installed
+helpers and clients require separate compatibility verification.
 
 The agent instructions are in [docs/AGENT.md](docs/AGENT.md). No global agent settings are modified.
 
@@ -214,10 +222,10 @@ updated guest helper is running. Do not force-stop a guest with unsaved work.
 - Host input and screen APIs are not used for agent actions. The helper refuses to run unless `hw.model` starts with `VirtualMac`. That check prevents accidental host execution; it is not hardware attestation or a defense against a compromised host.
 - The guest sees three explicit shares: `control` (read/write, containing request/reply JSON and screenshots) `tools` (read-only helper app), and `artifacts` (private per-machine read-only inbox). Artifact staging lives under the VM data directory, never inside the signed app bundle. Host home, project folders, microphone, and camera are not attached. Clipboard text crosses only on an explicit Copy/Paste action; neither clipboard is polled or mirrored.
 - There is no remote-control network listener. The flat mailbox pins its directory, rejects symlinks, hardlinks and nonregular files on reads, bounds message sizes, checks request IDs, and expires pending actions. The host never executes guest-provided content.
-- Default NAT networking permits guest internet access and may reach services on the host or local network. This is **not** a network-isolated or hardened hostile-code environment. `--offline` removes that network path.
+- Default NAT networking permits guest internet access and may reach services on the host or local network. This is **not** a network-isolated or hardened hostile-code environment. `--offline` configures no NAT device; verify the running guest separately before claiming isolation.
 - A logged-out/locked guest, missing helper, denied guest permissions, or paused VM prevents normal computer use. TCC grants are interactive guest setup, not bypassed by the CLI.
 
-VM cloning, rollback checkpoints, accessibility snapshots, fully unattended guest setup, terminal splits and tmux transport remain future work. The native Virtualization framework does not itself render a Mac into a terminal or offer an agent input API; this project supplies the guest transport and terminal presentation layers.
+Rollback checkpoints, accessibility snapshots, fully unattended guest setup, terminal splits and tmux transport remain future work. The native Virtualization framework does not itself render a Mac into a terminal or offer an agent input API; this project supplies the guest transport and terminal presentation layers.
 
 ## Development and validation
 

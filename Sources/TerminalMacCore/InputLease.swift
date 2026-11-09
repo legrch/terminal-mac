@@ -3,9 +3,11 @@ import Darwin
 
 /// Host-side exclusive guest-input ownership for one machine.
 ///
-/// The flock file is the authority: the kernel releases the lock when a holder crashes, so the
-/// lease self-heals. The sibling JSON is evidence metadata (owner, generation, acquisition time)
-/// and never grants anything on its own. Consumers that cannot use this class — a product
+/// The flock file is the cooperative live-owner authority. The kernel releases flock on a
+/// crash, but persisted machine metadata or a helper-update marker remains an unresolved-effect
+/// fence until reconciled: a free flock alone is NOT permission to acquire the lease.
+/// The sibling JSON records owner/generation/time, but is not a transferable credential.
+/// Consumers that cannot use this class — a product
 /// scenario in another language, for example — acquire the same lock file with the same flock
 /// semantics and write the same metadata shape; that published file contract is the cross-runtime
 /// interface, deliberately not a daemon or RPC.
@@ -34,12 +36,22 @@ public final class InputLease {
     private let directory: URL
     private var fd: Int32
     private var released = false
+    // The exact file this acquisition created. Stale or substituted records are not ours
+    // to remove, even if they carry the same owner text.
+    private struct MetadataReceipt {
+        let device: UInt64
+        let inode: UInt64
+        let bytes: Data
+    }
+    private let metadataReceipt: MetadataReceipt
 
-    private init(directory: URL, fd: Int32, owner: String, generation: Int) {
+    private init(directory: URL, fd: Int32, owner: String, generation: Int,
+                 metadataReceipt: MetadataReceipt) {
         self.directory = directory
         self.fd = fd
         self.owner = owner
         self.generation = generation
+        self.metadataReceipt = metadataReceipt
     }
 
     public static func validate(owner: String) throws {
@@ -49,36 +61,66 @@ public final class InputLease {
         }
     }
 
-    /// Acquire the exclusive lease or fail before any guest effect with the current holder.
+    /// Acquisition checks BOTH predecessor records while owning the kernel flock. Neither an
+    /// expired/unreadable update marker nor an orphaned machine metadata file authorizes takeover.
+    /// A failed/uncertain publication leaves its new metadata for explicit reconciliation.
     public static func acquire(directory: URL, owner: String, generation: Int) throws -> InputLease {
+        try acquire(directory: directory, owner: owner, generation: generation,
+                    beforeMetadataPublication: {}, beforeDirectorySync: {})
+    }
+
+    /// Deterministic fault/race seams for Core tests. Production uses the public wrapper above.
+    /// These closures execute while the real kernel flock is held; they never run in the guest.
+    static func acquire(directory: URL, owner: String, generation: Int,
+                        beforeMetadataPublication: () throws -> Void,
+                        beforeDirectorySync: () throws -> Void) throws -> InputLease {
         try validate(owner: owner)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
         let fd = try openValidatedLock(directory)
         if flock(fd, LOCK_EX | LOCK_NB) != 0 {
             let code = errno
             close(fd)
-            guard isContention(code) else { throw Failure("Cannot acquire input lease: \(String(cString: strerror(code)))") }
+            guard isContention(code) else {
+                throw Failure("Cannot acquire input lease: \(String(cString: strerror(code)))")
+            }
             throw LeaseConflict(owner: readMetadata(directory)?.owner)
         }
         do {
+            // Do not use fileExists: a dangling symlink can appear absent. An unclassifiable
+            // lstat error also refuses; only ENOENT proves there is no predecessor metadata.
+            try requireNoOutstandingMetadata(directory)
+            let exchange = try Mailbox(directory.appendingPathComponent("exchange"), create: true)
+            try exchange.requireNoOutstandingUpdateMarker()
             let metadata = Metadata(schema: schema, owner: owner, generation: generation,
                                     acquiredAt: Int(Date().timeIntervalSince1970))
-            try writeDurable(JSONEncoder().encode(metadata), at: directory.appendingPathComponent(metadataName))
+            let bytes = try JSONEncoder().encode(metadata)
+            try beforeMetadataPublication()
+            // O_EXCL is the second admission barrier if an uncooperative writer creates a
+            // record after the lstat preflight. Never rename over any predecessor entry.
+            let receipt = try publishExclusiveMetadata(bytes, directory: directory,
+                                                       beforeDirectorySync: beforeDirectorySync)
+            return InputLease(directory: directory, fd: fd, owner: owner,
+                              generation: generation, metadataReceipt: receipt)
         } catch {
-            flock(fd, LOCK_UN)
+            // Only the kernel lock is ours to release on prepublication failure. Never
+            // unlink a possibly preexisting or ambiguously published metadata/marker file.
+            _ = flock(fd, LOCK_UN)
             close(fd)
             throw error
         }
-        return InputLease(directory: directory, fd: fd, owner: owner, generation: generation)
     }
 
-    /// Release after in-flight work is resolved; idempotent. The caller owns the rule that an
-    /// unresolved operation must not be abandoned — expiry of the metadata never clears effects.
-    public func release() {
+    /// A clean release removes only this acquisition's exact metadata inode and bytes.
+    /// An unresolved action, lost marker-release ACK or abnormal exit retains the record;
+    /// releasing flock alone never proves an issued guest effect finished.
+    public func release(preserveMetadata: Bool = false) {
         guard !released else { return }
         released = true
-        Self.removeDurable(directory: directory, name: Self.metadataName)
-        flock(fd, LOCK_UN)
+        if !preserveMetadata {
+            Self.removeOwnedMetadata(directory: directory, receipt: metadataReceipt)
+        }
+        _ = flock(fd, LOCK_UN)
         close(fd)
         fd = -1
     }
@@ -87,12 +129,14 @@ public final class InputLease {
         if !released && fd >= 0 { flock(fd, LOCK_UN); close(fd) }
     }
 
-    /// A probe is not custody: it only establishes the instant's lock state.
-    /// In particular, unreadable holder metadata never becomes an owner named "unknown".
+    /// A probe is not custody: it only establishes the instant's admission state.
+    /// A free kernel lock plus orphaned metadata/update marker is UNRESOLVED, not FREE;
+    /// in particular, an unavailable holder never becomes an owner named "unknown".
     public enum Probe: Equatable {
         case free
         case held(owner: String, generation: Int)
         case heldUnknown
+        case unresolved
     }
 
     private static func isContention(_ code: Int32) -> Bool {
@@ -115,9 +159,9 @@ public final class InputLease {
         return fd
     }
 
-    /// Free is returned ONLY after the validated file was exclusively flocked.
-    /// Unexpected flock errors propagate. Metadata only names a genuine contention;
-    /// it cannot make a held lock free or an unknown owner act as a credential.
+    /// Free requires a validated, successfully flocked file AND absence of both
+    /// predecessor evidence entries while the flock is held. Unexpected I/O errors
+    /// propagate. A stale record is not an owner credential or proof of completion.
     public static func probe(directory: URL) throws -> Probe {
         try probe(directory: directory) { flock($0, LOCK_EX | LOCK_NB) }
     }
@@ -127,10 +171,18 @@ public final class InputLease {
         let fd = try openValidatedLock(directory)
         defer { close(fd) }
         if attemptLock(fd) == 0 {
+            // Inspect under the same nonblocking flock. The exception path still unlocks;
+            // retained evidence is never removed by an observational probe.
+            let state: Probe
+            do { state = try predecessorProbe(directory) }
+            catch {
+                _ = flock(fd, LOCK_UN)
+                throw error
+            }
             guard flock(fd, LOCK_UN) == 0 else {
                 throw Failure("Cannot release input lease probe: \(String(cString: strerror(errno)))")
             }
-            return .free
+            return state
         }
         let code = errno
         guard isContention(code) else {
@@ -142,11 +194,12 @@ public final class InputLease {
 
     /// A scenario's existing owner token is kept for cooperative CLI calls. This
     /// does not authenticate that token or hold the lease through the action.
-    public enum Admission: Equatable { case allowed, locked(owner: String), lockedUnknown }
+    public enum Admission: Equatable { case allowed, locked(owner: String), lockedUnknown, lockedUnresolved }
     public static func admission(probe: Probe, claimedOwner: String?) -> Admission {
         switch probe {
         case .free: return .allowed
         case .heldUnknown: return .lockedUnknown
+        case .unresolved: return .lockedUnresolved
         case .held(let owner, _):
             return claimedOwner == owner ? .allowed : .locked(owner: owner)
         }
@@ -158,6 +211,7 @@ public final class InputLease {
         switch probe {
         case .free: return nil
         case .heldUnknown: return "another client (holder identity unavailable)"
+        case .unresolved: return "an unresolved previous guest operation (input refused)"
         case .held(let owner, _): return windowOwner == owner ? nil : owner
         }
     }
@@ -181,41 +235,123 @@ public final class InputLease {
         return metadata
     }
 
-    /// fsync the metadata before rename and the directory entry after, so an acquired lease is
-    /// visible after a crash. This is the connector-key-store ordering contract.
-    static func writeDurable(_ data: Data, at url: URL) throws {
-        let directory = url.deletingLastPathComponent()
-        let temporary = directory.appendingPathComponent("." + UUID().uuidString + ".tmp")
-        let out = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        guard out >= 0 else { throw Failure("Cannot write lease metadata: \(String(cString: strerror(errno)))") }
+    /// Read-only predecessor admission after the probe acquired the kernel lock.
+    /// A missing exchange directory is the ordinary pre-bootstrap state; every
+    /// present unsafe exchange or update marker refuses instead of guessing FREE.
+    /// The mailbox opens its directory with O_DIRECTORY|O_NOFOLLOW, and its marker
+    /// reader uses O_NONBLOCK, so dangling symlinks and FIFOs cannot hang a probe.
+    private static func predecessorProbe(_ directory: URL) throws -> Probe {
+        var info = stat()
+        let metadata = directory.appendingPathComponent(metadataName).path
+        if lstat(metadata, &info) == 0 { return .unresolved }
+        guard errno == ENOENT else {
+            throw Failure("Cannot inspect input lease predecessor metadata: \(String(cString: strerror(errno)))")
+        }
+        let exchangeURL = directory.appendingPathComponent("exchange")
+        if lstat(exchangeURL.path, &info) != 0 {
+            guard errno == ENOENT else {
+                throw Failure("Cannot inspect guest exchange for custody evidence: \(String(cString: strerror(errno)))")
+            }
+            return .free
+        }
+        // An exchange alias, FIFO, or other unexpected entry is not an absent
+        // marker. Do not follow or open it to search for a potentially stale flag.
+        guard (info.st_mode & S_IFMT) == S_IFDIR else { return .unresolved }
+        let mailbox = try Mailbox(exchangeURL)
+        return mailbox.helperUpdateDisposition() == .unmarked ? .free : .unresolved
+    }
+
+    private static func requireNoOutstandingMetadata(_ directory: URL) throws {
+        var info = stat()
+        let path = directory.appendingPathComponent(metadataName).path
+        if lstat(path, &info) == 0 {
+            throw Failure("Unresolved input lease metadata exists; reconcile the previous owner before acquiring guest input")
+        }
+        guard errno == ENOENT else {
+            throw Failure("Cannot inspect input lease predecessor metadata: \(String(cString: strerror(errno)))")
+        }
+    }
+
+    /// Create only a previously absent owner record, never replace via rename. A partial write,
+    /// failed sync or crash may leave an incomplete file, which blocks the next acquisition until
+    /// explicit reconciliation. In particular, a successful kernel lock does not clear it.
+    private static func publishExclusiveMetadata(_ data: Data, directory: URL,
+                                                 beforeDirectorySync: () throws -> Void) throws -> MetadataReceipt {
+        let path = directory.appendingPathComponent(metadataName).path
+        let out = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0o600)
+        guard out >= 0 else {
+            if errno == EEXIST {
+                throw Failure("Unresolved input lease metadata appeared during acquisition; refuse overwrite")
+            }
+            throw Failure("Cannot publish exclusive input lease metadata: \(String(cString: strerror(errno)))")
+        }
+        var info = stat()
         do {
+            guard fstat(out, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
+                  info.st_nlink == 1, info.st_uid == geteuid(), info.st_mode & 0o077 == 0 else {
+                throw Failure("Cannot verify exclusive input lease metadata file")
+            }
             try data.withUnsafeBytes { bytes in
                 var offset = 0
                 while offset < bytes.count {
                     let count = Darwin.write(out, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
                     if count < 0 && errno == EINTR { continue }
-                    guard count > 0 else { throw Failure("Cannot write lease metadata") }
+                    guard count > 0 else { throw Failure("Cannot write input lease metadata") }
                     offset += count
                 }
             }
-            guard fsync(out) == 0 else { throw Failure("Cannot sync lease metadata") }
+            guard fsync(out) == 0 else { throw Failure("Cannot sync input lease metadata") }
         } catch {
+            // The newly created file may be visible/partly durable: preserve, never unlink.
             close(out)
-            unlink(temporary.path)
             throw error
         }
-        close(out)
-        guard rename(temporary.path, url.path) == 0 else {
-            unlink(temporary.path)
-            throw Failure("Cannot publish lease metadata")
-        }
-        syncDirectory(directory)
+        guard close(out) == 0 else { throw Failure("Cannot close input lease metadata safely") }
+        try beforeDirectorySync()
+        try syncDirectoryChecked(directory)
+        return MetadataReceipt(device: UInt64(info.st_dev), inode: UInt64(info.st_ino), bytes: data)
     }
 
-    static func removeDurable(directory: URL, name: String) {
-        // ENOENT only means the metadata was already gone; the entry sync still applies.
-        unlink(directory.appendingPathComponent(name).path)
-        syncDirectory(directory)
+    private static func removeOwnedMetadata(directory: URL, receipt: MetadataReceipt) {
+        let path = directory.appendingPathComponent(metadataName).path
+        let input = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard input >= 0 else { return }
+        defer { close(input) }
+        var info = stat()
+        guard fstat(input, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_nlink == 1, info.st_uid == geteuid(), info.st_mode & 0o077 == 0,
+              UInt64(info.st_dev) == receipt.device,
+              UInt64(info.st_ino) == receipt.inode, info.st_size == receipt.bytes.count else { return }
+        var bytes = Data(count: receipt.bytes.count)
+        let count = bytes.withUnsafeMutableBytes { pointer -> Int in
+            guard let base = pointer.baseAddress else { return 0 }
+            var offset = 0
+            while offset < pointer.count {
+                let n = Darwin.read(input, base.advanced(by: offset), pointer.count - offset)
+                if n < 0 && errno == EINTR { continue }
+                if n <= 0 { return -1 }
+                offset += n
+            }
+            return offset
+        }
+        guard count == receipt.bytes.count, bytes == receipt.bytes else { return }
+        // Protect against a swapped pathname after opening the descriptor. The kernel flock
+        // serializes cooperative owners; this is not an adversarial filesystem transaction.
+        var named = stat()
+        guard lstat(path, &named) == 0, UInt64(named.st_dev) == receipt.device,
+              UInt64(named.st_ino) == receipt.inode else { return }
+        if unlink(path) == 0 { syncDirectory(directory) }
+    }
+
+    private static func syncDirectoryChecked(_ directory: URL) throws {
+        let fd = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else {
+            throw Failure("Cannot open input lease metadata directory for sync")
+        }
+        let result = fsync(fd)
+        let code = errno
+        close(fd)
+        guard result == 0 else { throw Failure("Cannot sync input lease metadata directory: \(String(cString: strerror(code)))") }
     }
 
     static func syncDirectory(_ directory: URL) {
