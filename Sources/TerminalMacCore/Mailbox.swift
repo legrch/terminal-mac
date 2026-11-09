@@ -20,8 +20,8 @@ public struct MailboxTimeout: LocalizedError {
 /// `respond` writes into that existing slot; once the caller stops waiting it removes the slot, so
 /// a late responder cannot recreate a named reply after the caller gave up or was cancelled. Screenshot
 /// artifacts follow the same rule: the caller prepares an `image-` slot and the helper publishes
-/// into it. This requires both sides of an exchange to run the same protocol version; a peer that
-/// does not manage slots fails closed with a visible error instead of falling back.
+/// into it. These slot guarantees require both peers to implement this protocol. A legacy peer can
+/// still recreate a late reply; compatible peer admission is not yet enforced here.
 public final class Mailbox {
     private let fd: Int32
     public init(_ url: URL, create: Bool = false) throws {
