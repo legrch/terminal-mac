@@ -115,8 +115,14 @@ final class CLI {
             try validateName(name)
             let directory = try store.directory(name)
             _ = try store.load(name)
-            let holder = InputLease.holder(directory: directory)
-            let status = try JSONSerialization.data(withJSONObject: holder.map { ["held": true, "owner": $0] } ?? ["held": false, "owner": NSNull()],
+            let state = try InputLease.probe(directory: directory)
+            let response: [String: Any]
+            switch state {
+            case .free: response = ["held": false, "owner": NSNull()]
+            case .held(let owner, _): response = ["held": true, "owner": owner]
+            case .heldUnknown: response = ["held": true, "owner": NSNull(), "state": "holder-unknown"]
+            }
+            let status = try JSONSerialization.data(withJSONObject: response,
                                                     options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
             print(String(decoding: status, as: UTF8.self))
         case "rename":
@@ -143,8 +149,12 @@ final class CLI {
             guard tail.count == 2, ["copy", "paste"].contains(tail[1]) else { throw Failure("Usage: terminal-mac clipboard NAME copy|paste") }
             let name = tail[0]
             try validateName(name)
-            guard Self.isRunning(try store.directory(name)) else { throw Failure("VM is not running") }
-            let mailbox = try Mailbox(store.directory(name).appendingPathComponent("exchange"))
+            let directory = try store.directory(name)
+            guard case .free = try InputLease.probe(directory: directory) else {
+                throw Failure("Guest input is locked; use a lease-holder action or wait for its completion")
+            }
+            guard Self.isRunning(directory) else { throw Failure("VM is not running") }
+            let mailbox = try Mailbox(directory.appendingPathComponent("exchange"))
             if tail[1] == "paste" { try await ClipboardBridge.paste(mailbox) }
             else { try await ClipboardBridge.copy(mailbox) }
             try printJSON(["clipboard": tail[1], "state": "done"])
@@ -221,9 +231,10 @@ final class CLI {
         let directory = try store.directory(name)
         // A scenario holding the run lease drives its own CLI actions with the same owner token;
         // anyone else is refused before a request is written.
-        switch InputLease.admission(holder: InputLease.holder(directory: directory), claimedOwner: args.options["owner"]) {
+        switch InputLease.admission(probe: try InputLease.probe(directory: directory), claimedOwner: args.options["owner"]) {
         case .allowed: break
-        case .locked(let holder): throw Failure("Guest input is locked by \(holder); wait for it to finish or pass --owner \(holder)")
+        case .locked(let holder): throw Failure("Guest input is locked by \(holder); wait for its holder to finish")
+        case .lockedUnknown: throw Failure("Guest input is locked by another client; holder identity is unavailable")
         }
         let mailbox = try Mailbox(directory.appendingPathComponent("exchange"))
         let request = Request(action: verb, arguments: parameters, timeout: Double(timeout))

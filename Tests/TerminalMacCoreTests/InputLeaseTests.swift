@@ -14,12 +14,12 @@ final class InputLeaseTests: XCTestCase {
             let conflict = error as? LeaseConflict
             XCTAssertEqual(conflict?.owner, "farol-smoke:run-1")
         }
-        XCTAssertEqual(InputLease.holder(directory: directory), "farol-smoke:run-1")
+        XCTAssertEqual(try InputLease.probe(directory: directory), .held(owner: "farol-smoke:run-1", generation: 7))
         lease.release()
-        XCTAssertNil(InputLease.holder(directory: directory))
+        XCTAssertEqual(try InputLease.probe(directory: directory), .free)
         // Idempotent release keeps the contract simple for defer-based cleanup.
         lease.release()
-        XCTAssertNil(InputLease.holder(directory: directory))
+        XCTAssertEqual(try InputLease.probe(directory: directory), .free)
     }
 
     func testMetadataShapeAndAtomicPublication() throws {
@@ -36,12 +36,12 @@ final class InputLeaseTests: XCTestCase {
     func testMetadataIsReadableAfterHolderCrashSimulation() throws {
         // flock releases on process death; the probe must then report free without stale
         // metadata blocking anyone. A released lock plus present metadata must not grant
-        // anything: holder() reports the free lease as nil.
+        // anything: a successful free-lock probe reports .free.
         let directory = try temporary()
         let lease = try InputLease.acquire(directory: directory, owner: "mcp", generation: 1)
-        XCTAssertNotNil(InputLease.holder(directory: directory))
+        XCTAssertEqual(try InputLease.probe(directory: directory), .held(owner: "mcp", generation: 1))
         lease.release()
-        XCTAssertNil(InputLease.holder(directory: directory))
+        XCTAssertEqual(try InputLease.probe(directory: directory), .free)
     }
 
     func testOwnerValidation() throws {
@@ -54,19 +54,21 @@ final class InputLeaseTests: XCTestCase {
     }
 
     func testAdmissionMatrix() {
-        XCTAssertEqual(InputLease.admission(holder: nil, claimedOwner: nil), .allowed)
-        XCTAssertEqual(InputLease.admission(holder: nil, claimedOwner: "farol"), .allowed)
-        XCTAssertEqual(InputLease.admission(holder: "farol", claimedOwner: "farol"), .allowed)
-        XCTAssertEqual(InputLease.admission(holder: "farol", claimedOwner: nil), .locked(owner: "farol"))
-        XCTAssertEqual(InputLease.admission(holder: "farol", claimedOwner: "viewer"), .locked(owner: "farol"))
+        XCTAssertEqual(InputLease.admission(probe: .free, claimedOwner: nil), .allowed)
+        XCTAssertEqual(InputLease.admission(probe: .free, claimedOwner: "farol"), .allowed)
+        XCTAssertEqual(InputLease.admission(probe: .held(owner: "farol", generation: 3), claimedOwner: "farol"), .allowed)
+        XCTAssertEqual(InputLease.admission(probe: .held(owner: "farol", generation: 3), claimedOwner: nil), .locked(owner: "farol"))
+        XCTAssertEqual(InputLease.admission(probe: .held(owner: "farol", generation: 3), claimedOwner: "viewer"), .locked(owner: "farol"))
+        XCTAssertEqual(InputLease.admission(probe: .heldUnknown, claimedOwner: "unknown"), .lockedUnknown)
     }
 
     func testNativeWindowMatrix() {
-        XCTAssertTrue(InputLease.nativeWindowAllowed(holder: nil, windowOwner: nil))
-        XCTAssertTrue(InputLease.nativeWindowAllowed(holder: nil, windowOwner: "viewer"))
-        XCTAssertTrue(InputLease.nativeWindowAllowed(holder: "viewer", windowOwner: "viewer"))
-        XCTAssertFalse(InputLease.nativeWindowAllowed(holder: "farol-smoke:run-1", windowOwner: nil))
-        XCTAssertFalse(InputLease.nativeWindowAllowed(holder: "farol-smoke:run-1", windowOwner: "viewer"))
+        XCTAssertNil(InputLease.nativeWindowDenial(probe: .free, windowOwner: nil))
+        XCTAssertNil(InputLease.nativeWindowDenial(probe: .free, windowOwner: "viewer"))
+        XCTAssertNil(InputLease.nativeWindowDenial(probe: .held(owner: "viewer", generation: 1), windowOwner: "viewer"))
+        XCTAssertNotNil(InputLease.nativeWindowDenial(probe: .held(owner: "farol-smoke:run-1", generation: 1), windowOwner: nil))
+        XCTAssertNotNil(InputLease.nativeWindowDenial(probe: .held(owner: "farol-smoke:run-1", generation: 1), windowOwner: "viewer"))
+        XCTAssertNotNil(InputLease.nativeWindowDenial(probe: .heldUnknown, windowOwner: "unknown"))
     }
 
     func testLeaseFlagPublishExpiryAndClear() throws {

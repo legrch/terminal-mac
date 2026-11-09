@@ -154,9 +154,13 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
         view.virtualMachine = vm
         view.capturesSystemKeys = false
         view.inputGate = { [weak self] in
-            guard let self else { return nil }
-            let holder = InputLease.holder(directory: self.directory)
-            return InputLease.nativeWindowAllowed(holder: holder, windowOwner: self.windowOwner) ? nil : holder
+            guard let self else { return "an unavailable VM runtime" }
+            do {
+                let state = try InputLease.probe(directory: self.directory)
+                return InputLease.nativeWindowDenial(probe: state, windowOwner: self.windowOwner)
+            } catch {
+                return "an unavailable lease check (input refused)"
+            }
         }
         let window = ClipboardMachineWindow(contentRect: view.frame, styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
         window.title = "terminal-mac · \(machine.name)"

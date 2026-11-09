@@ -171,8 +171,12 @@ public struct Store {
         if flock(lock, LOCK_EX | LOCK_NB) == 0 { flock(lock, LOCK_UN) } else { running = true }
         close(lock)
         guard !running else { throw Failure("VM '\(from)' is running. Stop it with: terminal-mac stop \(from)") }
-        if let holder = InputLease.holder(directory: source) {
-            throw Failure("Guest input is locked by \(holder); wait for it to finish before renaming")
+        switch try InputLease.probe(directory: source) {
+        case .free: break
+        case .held(let owner, _):
+            throw Failure("Guest input is locked by \(owner); wait for it to finish before renaming")
+        case .heldUnknown:
+            throw Failure("Guest input is locked by another client with unavailable identity; refuse renaming")
         }
         guard Darwin.rename(source.path, destination.path) == 0 else {
             throw Failure("Cannot rename machine directory: \(String(cString: strerror(errno)))")
@@ -222,8 +226,12 @@ public struct Store {
         if flock(lock, LOCK_EX | LOCK_NB) == 0 { flock(lock, LOCK_UN) } else { running = true }
         close(lock)
         guard !running else { throw Failure("VM '\(from)' is running. Stop it with: terminal-mac stop \(from)") }
-        if let holder = InputLease.holder(directory: source) {
-            throw Failure("Guest input is locked by \(holder); wait for it to finish before cloning")
+        switch try InputLease.probe(directory: source) {
+        case .free: break
+        case .held(let owner, _):
+            throw Failure("Guest input is locked by \(owner); wait for it to finish before cloning")
+        case .heldUnknown:
+            throw Failure("Guest input is locked by another client with unavailable identity; refuse cloning")
         }
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         // The destination is new, so any failure removes the partial directory instead of leaving it.

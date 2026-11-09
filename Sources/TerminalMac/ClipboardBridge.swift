@@ -44,7 +44,14 @@ final class ClipboardMachineView: VZVirtualMachineView {
     private var transferring = false
     private var lastGateNotice = Date.distantPast
     private func denied() -> Bool {
-        guard let inputGate, let holder = inputGate() else { return false }
+        // A view without its runtime gate must not silently become interactive.
+        let holder: String
+        if let inputGate {
+            guard let reason = inputGate() else { return false }
+            holder = reason
+        } else {
+            holder = "an unavailable input gate"
+        }
         if Date().timeIntervalSince(lastGateNotice) > 1 {
             lastGateNotice = Date()
             stderr("Guest input is locked by \(holder)")
