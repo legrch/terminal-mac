@@ -30,7 +30,7 @@ case "$identity" in
 esac
 export CLANG_MODULE_CACHE_PATH="$PWD/.build/ModuleCache"
 export SWIFTPM_MODULECACHE_OVERRIDE="$CLANG_MODULE_CACHE_PATH"
-build_options=(--disable-sandbox --cache-path "$PWD/.build/cache" --config-path "$PWD/.build/configuration" --security-path "$PWD/.build/security")
+build_options=(--cache-path "$PWD/.build/cache" --config-path "$PWD/.build/configuration" --security-path "$PWD/.build/security")
 swift build "${build_options[@]}" -c "$configuration"
 binary_dir="$(swift build "${build_options[@]}" -c "$configuration" --show-bin-path)"
 app="$PWD/dist/TerminalMac.app"

@@ -232,7 +232,7 @@ Rollback checkpoints, accessibility snapshots, fully unattended guest setup, ter
 ```sh
 CLANG_MODULE_CACHE_PATH=/tmp/terminal-mac-modules \
 SWIFTPM_MODULECACHE_OVERRIDE=/tmp/terminal-mac-modules \
-swift test --disable-sandbox --scratch-path /tmp/terminal-mac-build \
+swift test --scratch-path /tmp/terminal-mac-build \
   --cache-path /tmp/terminal-mac-cache \
   --config-path /tmp/terminal-mac-config --security-path /tmp/terminal-mac-security
 ```
