@@ -34,6 +34,9 @@ public final class Mailbox {
         guard !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.contains("\0") else { throw Failure("Invalid mailbox filename") }
     }
     public func write(_ data: Data, named name: String) throws {
+        try write(data, named: name, replacing: true)
+    }
+    private func write(_ data: Data, named name: String, replacing: Bool) throws {
         try check(name)
         let temporary = ".\(UUID().uuidString).tmp"
         let out = openat(fd, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
@@ -48,7 +51,12 @@ public final class Mailbox {
                 offset += count
             }
         }
-        guard renameat(fd, temporary, fd, name) == 0 else { throw Failure("Cannot publish mailbox file") }
+        let result = replacing ? renameat(fd, temporary, fd, name) :
+            renameatx_np(fd, temporary, fd, name, UInt32(RENAME_EXCL))
+        guard result == 0 else {
+            if !replacing && errno == EEXIST { throw Failure("Stale mailbox request '\(name)' already exists") }
+            throw Failure("Cannot publish mailbox file: \(String(cString: strerror(errno)))")
+        }
     }
     /// Create an empty caller-owned publication slot. Never overwrites existing content.
     public func prepareSlot(_ name: String) throws {
@@ -64,12 +72,18 @@ public final class Mailbox {
     /// instead of recreating the name, so no late write can resurrect a file after cleanup.
     public func publish(_ data: Data, into name: String) throws {
         try check(name)
-        let out = openat(fd, name, O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC)
+        let out = openat(fd, name, O_WRONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         guard out >= 0 else {
             if errno == ENOENT { throw Failure("Mailbox slot '\(name)' was revoked; nothing published") }
             throw Failure("Cannot publish mailbox file (symlinks are rejected): \(String(cString: strerror(errno)))")
         }
         defer { close(out) }
+        // Check the opened object before truncating; O_NONBLOCK also avoids hanging on a FIFO.
+        var info = stat()
+        guard fstat(out, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_nlink == 1 else {
+            throw Failure("Invalid mailbox publication slot")
+        }
+        guard ftruncate(out, 0) == 0 else { throw Failure("Cannot truncate mailbox publication slot") }
         try data.withUnsafeBytes { bytes in
             var offset = 0
             while offset < bytes.count {
@@ -161,9 +175,11 @@ public final class Mailbox {
         try request.requireLive()
         let requestName = "request-\(request.id.uuidString).json"
         let replyName = "reply-\(request.id.uuidString).json"
-        defer { remove(requestName); remove(replyName) }
         try prepareSlot(replyName)
-        try write(JSONEncoder().encode(request), named: requestName)
+        defer { remove(replyName) }
+        // Refuse a preexisting request, and clean this request only after publication succeeds.
+        try write(JSONEncoder().encode(request), named: requestName, replacing: false)
+        defer { remove(requestName) }
         // Most replies land within a few milliseconds; back off for slow actions.
         var interval: UInt64 = 2_000_000
         while Date() < request.deadline {
