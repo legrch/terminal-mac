@@ -15,6 +15,60 @@ final class TerminalInputContractTests: XCTestCase {
         }
     }
 
+    func testCLIKeyResolutionCannotValidateOneChordAndDispatchAnother() throws {
+        // This is the exact shared production resolver used by CLI.action()
+        // for both admission and the outgoing mailbox's key argument.
+        XCTAssertEqual(try TerminalInputContract.resolvedKey(
+            verb: "key", option: nil, operands: ["cmd+n"]), "cmd+n")
+        XCTAssertEqual(try TerminalInputContract.resolvedKey(
+            verb: "key", option: "cmd+n", operands: []), "cmd+n")
+        XCTAssertEqual(try TerminalInputContract.resolvedKey(
+            verb: "terminal-key", option: "return", operands: []), "return")
+
+        // Before this fix, CLI checked --key=cmd+n but positional "return"
+        // overrode the request payload. The guest denied it, but CLI had
+        // already dispatched a contradictory guarded request.
+        for positional in ["return", "cmd+n"] {
+            XCTAssertThrowsError(try TerminalInputContract.resolvedKey(
+                verb: "key", option: "cmd+n", operands: [positional]))
+        }
+        XCTAssertThrowsError(try TerminalInputContract.resolvedKey(
+            verb: "terminal-key", option: nil, operands: []))
+        XCTAssertThrowsError(try TerminalInputContract.resolvedKey(
+            verb: "key", option: nil, operands: ["cmd+n", "return"]))
+        XCTAssertThrowsError(try TerminalInputContract.resolvedKey(
+            verb: "key", option: "", operands: []))
+        XCTAssertNil(try TerminalInputContract.resolvedKey(
+            verb: "type", option: nil, operands: ["literal input"]))
+
+        let guardedKey = try XCTUnwrap(TerminalInputContract.resolvedKey(
+            verb: "key", option: nil, operands: ["cmd+n"]))
+        XCTAssertEqual(try TerminalInputContract.wireAction(
+            "key", proof: TerminalInputContract.foreground, pid: "42",
+            key: guardedKey), "terminal-key")
+        let refusedKey = try XCTUnwrap(TerminalInputContract.resolvedKey(
+            verb: "key", option: nil, operands: ["return"]))
+        XCTAssertThrowsError(try TerminalInputContract.wireAction(
+            "key", proof: TerminalInputContract.foreground, pid: "42",
+            key: refusedKey))
+    }
+
+    func testGuardedReturnUsesSameCanonicalKeyWithWindowBinding() throws {
+        let window = "00000000-0000-4000-8000-000000000001"
+        let key = try XCTUnwrap(TerminalInputContract.resolvedKey(
+            verb: "terminal-key", option: "return", operands: []))
+        XCTAssertEqual(try TerminalInputContract.wireAction(
+            "terminal-key", proof: TerminalInputContract.input, pid: "42",
+            window: window, key: key), "terminal-key")
+        try TerminalInputContract.requireFocus(
+            proof: TerminalInputContract.input, expectedPID: "42",
+            actualPID: 42, foreground: true, input: true,
+            expectedWindow: window, actualWindow: window, key: key)
+        XCTAssertThrowsError(try TerminalInputContract.wireAction(
+            "terminal-key", proof: TerminalInputContract.foreground,
+            pid: "42", key: key))
+    }
+
     func testInvalidGuardCannotFallBackToLegacyInput() {
         let window = "00000000-0000-4000-8000-000000000001"
         for pid in ["", "0", "-1", "0042", "42x", "2147483648"] {

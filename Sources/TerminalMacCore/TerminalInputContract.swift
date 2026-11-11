@@ -8,6 +8,18 @@ public enum TerminalInputContract {
     public static let foreground = "terminal-foreground/2"
     public static let input = "terminal-input/2"
 
+    /// Resolve an action key exactly once, before both guard admission and
+    /// mailbox request construction. Conflicting --key and positional forms
+    /// must not let CLI validate one chord and dispatch a different chord.
+    public static func resolvedKey(verb: String, option: String?, operands: [String]) throws -> String? {
+        guard verb == "key" || verb == "terminal-key" else { return nil }
+        guard operands.count <= 1, !(option != nil && !operands.isEmpty),
+              let key = operands.first ?? option, !key.isEmpty else {
+            throw OutcomeFailure("TERMINAL_GUARD_INVALID", outcome: .noEffect)
+        }
+        return key
+    }
+
     public static func wireAction(_ verb: String, proof: String?, pid: String?, window: String? = nil, key: String? = nil) throws -> String {
         let guardedVerb = verb == "terminal-type" || verb == "terminal-key"
         guard proof != nil || pid != nil || window != nil || guardedVerb else { return verb }

@@ -230,7 +230,8 @@ final class CLI {
         let args = try Arguments(input, flags: ["double", "structured-errors"], options: ["vm", "x", "y", "x2", "y2", "dx", "dy", "text", "key", "button", "count", "output", "timeout", "owner", "terminal-proof", "terminal-pid", "terminal-window"])
         let target = try GuestActionTarget(positionals: args.positionals, explicitName: args.options["vm"])
         let name = target.name, verb = target.verb
-        let requestedKey = args.options["key"] ?? (target.operands.count == 1 ? target.operands[0] : nil)
+        let requestedKey = try TerminalInputContract.resolvedKey(
+            verb: verb, option: args.options["key"], operands: target.operands)
         let wireVerb = try TerminalInputContract.wireAction(verb, proof: args.options["terminal-proof"],
             pid: args.options["terminal-pid"], window: args.options["terminal-window"], key: requestedKey)
         var positions = target.operands
@@ -241,7 +242,10 @@ final class CLI {
         if let pid = parameters.removeValue(forKey: "terminal-pid") { parameters["terminalPID"] = pid }
         if let window = parameters.removeValue(forKey: "terminal-window") { parameters["terminalWindow"] = window }
         if ["type", "terminal-type", "clipboard-paste"].contains(verb), !positions.isEmpty { parameters["text"] = positions.joined(separator: " "); positions.removeAll() }
-        if ["key", "terminal-key"].contains(verb), positions.count == 1 { parameters["key"] = positions.removeFirst() }
+        if ["key", "terminal-key"].contains(verb), !positions.isEmpty {
+            parameters["key"] = requestedKey
+            positions.removeAll()
+        }
         if ["click", "move"].contains(verb), positions.count == 2 { parameters["x"] = positions.removeFirst(); parameters["y"] = positions.removeFirst() }
         if verb == "drag", positions.count == 4 {
             for key in ["x", "y", "x2", "y2"] { parameters[key] = positions.removeFirst() }
