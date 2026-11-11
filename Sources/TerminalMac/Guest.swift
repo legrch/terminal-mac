@@ -28,6 +28,10 @@ final class GuestRuntime: NSObject {
 
     let tools: URL
     var lastUpdateCheck = Date.distantPast
+    // Opaque window identity for guarded input; never contains terminal text.
+    var terminalWindow: AXUIElement?
+    var terminalInputElement: AXUIElement?
+    var terminalWindowToken: String?
 
     init(exchange: URL) throws {
         try GuestGuard.requireVirtualMac()
@@ -99,26 +103,38 @@ final class GuestRuntime: NSObject {
     func handle(_ request: Request) async {
         // Provenance for the failure reply: anything after the first guest effect must be
         // treated as if the effect may have happened, unless a specific confirmed outcome applies.
-        var touched = false
+        var effects = InputEffectProgress()
         do {
             try GuestGuard.requireVirtualMac()
             try request.requireLive()
             var values: [String: String] = [:]
+            if request.arguments["terminalProof"] != nil || request.arguments["terminalPID"] != nil || request.arguments["terminalWindow"] != nil || ["terminal-key", "terminal-type"].contains(request.action) {
+                let wire = try TerminalInputContract.wireAction(request.action,
+                    proof: request.arguments["terminalProof"], pid: request.arguments["terminalPID"],
+                    window: request.arguments["terminalWindow"], key: request.arguments["key"])
+                guard wire == request.action else { throw OutcomeFailure("TERMINAL_GUARD_INVALID", outcome: .noEffect) }
+            }
             switch request.action {
+            case "terminal-open":
+                guard request.arguments.isEmpty else { throw OutcomeFailure("TERMINAL_GUARD_INVALID", outcome: .noEffect) }
+                try requireAccessibility()
+                let applicationURL = try terminalApplicationURL()
+                try request.requireLive()
+                effects.begin()
+                values = try await launchTerminal(at: applicationURL)
             case "clipboard-paste":
                 try requireAccessibility()
                 guard let text = request.arguments["text"], text.utf8.count <= 32768 else {
                     throw OutcomeFailure("Clipboard text exceeds 32 KiB", outcome: .noEffect)
                 }
+                effects.begin()
                 NSPasteboard.general.clearContents()
-                touched = true
                 guard NSPasteboard.general.setString(text, forType: .string) else { throw Failure("Cannot write guest clipboard") }
                 try press("cmd+v")
             case "clipboard-copy":
                 try requireAccessibility()
                 let before = NSPasteboard.general.changeCount
-                try press("cmd+c")
-                touched = true
+                try press("cmd+c", beforeEvent: { effects.begin() })
                 let deadline = Date().addingTimeInterval(2)
                 while NSPasteboard.general.changeCount == before, Date() < deadline {
                     try await Task.sleep(nanoseconds: 20_000_000)
@@ -130,9 +146,15 @@ final class GuestRuntime: NSObject {
                 catch { throw OutcomeFailure(error.localizedDescription, outcome: .confirmedNoCopy) }
             case "status":
                 let bounds = CGDisplayBounds(CGMainDisplayID())
+                let terminal = terminalFocusEvidence()
                 values = ["screenRecording": String(CGPreflightScreenCaptureAccess()), "accessibility": String(AXIsProcessTrusted()),
                           "width": String(Int(bounds.width)), "height": String(Int(bounds.height)),
-                          "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.0"]
+                          "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.0",
+                          "terminalFocusContract": TerminalInputContract.version,
+                          "terminalLaunchContract": TerminalInputContract.launchVersion,
+                          "terminalForeground": String(terminal.foreground), "terminalInput": String(terminal.input),
+                          "terminalPID": terminal.pid.map { String($0) } ?? "", "terminalWindow": terminal.window ?? "",
+                          "shellReadiness": "not-proven"]
             case "screenshot" where request.arguments["format"] == "bgra-lz4":
                 guard CGPreflightScreenCaptureAccess() else { throw Failure("Allow Screen Recording for TerminalMacGuest inside the VM, then reopen the helper if macOS requests it") }
                 try await desktop.prepare(maxWidth: number(request, "maxWidth", range: 16...7680), maxHeight: number(request, "maxHeight", range: 16...4320))
@@ -165,14 +187,14 @@ final class GuestRuntime: NSObject {
                 let right = request.arguments["button"] == "right"
                 let button: CGMouseButton = right ? .right : .left
                 if request.action == "move" {
-                    touched = true
+                    effects.begin()
                     try postMouse(.mouseMoved, point: point, button: button)
                 }
                 else {
                     // `count` continues a multi-click the viewer already started, so a double click is two requests.
                     let count = try number(request, "count", fallback: 1, range: 1...3)
                     let clicks = request.arguments["double"] == "true" ? 1...2 : count...count
-                    touched = true
+                    effects.begin()
                     for n in clicks {
                         try postMouse(right ? .rightMouseDown : .leftMouseDown, point: point, button: button, count: n)
                         try postMouse(right ? .rightMouseUp : .leftMouseUp, point: point, button: button, count: n)
@@ -182,7 +204,7 @@ final class GuestRuntime: NSObject {
                 try requireAccessibility()
                 let start = try coordinates(request)
                 let end = try coordinates(request, x: "x2", y: "y2")
-                touched = true
+                effects.begin()
                 try postMouse(.leftMouseDown, point: start, button: .left)
                 let steps = max(2, min(30, Int(hypot(end.x - start.x, end.y - start.y) / 12)))
                 for step in 1...steps {
@@ -194,15 +216,15 @@ final class GuestRuntime: NSObject {
             case "scroll":
                 try requireAccessibility()
                 if request.arguments["x"] != nil {
-                    touched = true
+                    effects.begin()
                     try postMouse(.mouseMoved, point: coordinates(request), button: .left)
                 }
                 let dy = try number(request, "dy", range: -1000...1000)
                 let dx = Int(request.arguments["dx"] ?? "0") ?? 0
                 guard (-1000...1000).contains(dx), let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: Int32(dy), wheel2: Int32(dx), wheel3: 0) else { throw Failure("Invalid scroll") }
-                touched = true
+                effects.begin()
                 event.post(tap: .cghidEventTap)
-            case "type":
+            case "type", "terminal-type":
                 try requireAccessibility()
                 guard let text = request.arguments["text"], text.utf8.count <= 32768 else { throw OutcomeFailure("Provide text (maximum 32 KiB)", outcome: .noEffect) }
                 // Unicode events avoid modifying the guest or host clipboard.
@@ -215,8 +237,20 @@ final class GuestRuntime: NSObject {
                     down.flags = []; up.flags = []
                     chunk.withUnsafeBufferPointer { ptr in down.keyboardSetUnicodeString(stringLength: ptr.count, unicodeString: ptr.baseAddress!) }
                     down.flags = []; up.flags = []
-                    touched = true
-                    down.post(tap: .cghidEventTap); up.post(tap: .cghidEventTap); chunk.removeAll(keepingCapacity: true)
+                    // Re-evaluate the bound Terminal target for every chunk.
+                    // A later refusal cannot reclassify earlier chunks as noEffect.
+                    try effects.perform(check: {
+                        try request.requireLive()
+                        try self.requireTerminalProof(request)
+                        // AX queries are synchronous and bounded individually, but can
+                        // still cross the request deadline. Recheck immediately before
+                        // publishing any keyboard event.
+                        try Task.checkCancellation()
+                        try request.requireLive()
+                    }, effect: {
+                        down.post(tap: .cghidEventTap); up.post(tap: .cghidEventTap)
+                    })
+                    chunk.removeAll(keepingCapacity: true)
                 }
                 for character in text {
                     let units = Array(String(character).utf16)
@@ -224,15 +258,20 @@ final class GuestRuntime: NSObject {
                     chunk += units
                 }
                 try send()
-            case "key":
+            case "key", "terminal-key":
                 try requireAccessibility()
-                touched = true
-                try press(request.arguments["key"] ?? "")
+                try press(request.arguments["key"] ?? "", beforeEvent: {
+                    try request.requireLive()
+                    try self.requireTerminalProof(request)
+                    try Task.checkCancellation()
+                    try request.requireLive()
+                    effects.begin()
+                })
             default: throw OutcomeFailure("Unknown guest action: \(request.action)", outcome: .noEffect)
             }
             try mailbox.respond(Reply(id: request.id, values: values))
         } catch {
-            let outcome = (error as? OutcomeFailure)?.outcome ?? (touched ? .mutationUnknown : .noEffect)
+            let outcome = effects.outcome(for: error)
             try? mailbox.respond(Reply(id: request.id, error: error.localizedDescription, outcome: outcome))
         }
     }
@@ -253,7 +292,7 @@ final class GuestRuntime: NSObject {
         event.setIntegerValueField(.mouseEventClickState, value: Int64(count))
         event.post(tap: .cghidEventTap)
     }
-    func press(_ chord: String) throws {
+    func press(_ chord: String, beforeEvent: () throws -> Void = {}) throws {
         let parts = chord.lowercased().split(separator: "+").map(String.init)
         guard let key = parts.last, let code = Self.keys[key] else { throw Failure("Unknown key: \(chord). Example: cmd+space, return, ctrl+a") }
         var flags: CGEventFlags = []
@@ -268,7 +307,9 @@ final class GuestRuntime: NSObject {
         }
         for down in [true, false] {
             guard let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down) else { throw Failure("Cannot create key") }
-            event.flags = down ? flags : []; event.post(tap: .cghidEventTap)
+            event.flags = down ? flags : []
+            try beforeEvent()
+            event.post(tap: .cghidEventTap)
         }
     }
     static let keys: [String: CGKeyCode] = [

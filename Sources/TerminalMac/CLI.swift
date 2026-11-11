@@ -221,15 +221,27 @@ final class CLI {
         try await Mailbox(store.directory(name).appendingPathComponent("host-control")).call(Request(action: action, arguments: arguments, timeout: timeout))
     }
     func action(_ input: [String]) async throws {
-        let args = try Arguments(input, flags: ["double"], options: ["vm", "x", "y", "x2", "y2", "dx", "dy", "text", "key", "button", "count", "output", "timeout", "owner"])
+        // Diagnostics opt-in never copies error text or input operands. Respect
+        // '--' so literal payload cannot enable an option accidentally.
+        let structured = input.prefix(while: { $0 != "--" }).contains("--structured-errors")
+        var dispatched = false
+        var diagnosticPhase = "validation"
+        do {
+        let args = try Arguments(input, flags: ["double", "structured-errors"], options: ["vm", "x", "y", "x2", "y2", "dx", "dy", "text", "key", "button", "count", "output", "timeout", "owner", "terminal-proof", "terminal-pid", "terminal-window"])
         let target = try GuestActionTarget(positionals: args.positionals, explicitName: args.options["vm"])
         let name = target.name, verb = target.verb
+        let requestedKey = args.options["key"] ?? (target.operands.count == 1 ? target.operands[0] : nil)
+        let wireVerb = try TerminalInputContract.wireAction(verb, proof: args.options["terminal-proof"],
+            pid: args.options["terminal-pid"], window: args.options["terminal-window"], key: requestedKey)
         var positions = target.operands
         var parameters = args.options
         parameters.removeValue(forKey: "output"); parameters.removeValue(forKey: "timeout")
         parameters.removeValue(forKey: "vm"); parameters.removeValue(forKey: "owner")
-        if ["type", "clipboard-paste"].contains(verb), !positions.isEmpty { parameters["text"] = positions.joined(separator: " "); positions.removeAll() }
-        if verb == "key", positions.count == 1 { parameters["key"] = positions.removeFirst() }
+        if let proof = parameters.removeValue(forKey: "terminal-proof") { parameters["terminalProof"] = proof }
+        if let pid = parameters.removeValue(forKey: "terminal-pid") { parameters["terminalPID"] = pid }
+        if let window = parameters.removeValue(forKey: "terminal-window") { parameters["terminalWindow"] = window }
+        if ["type", "terminal-type", "clipboard-paste"].contains(verb), !positions.isEmpty { parameters["text"] = positions.joined(separator: " "); positions.removeAll() }
+        if ["key", "terminal-key"].contains(verb), positions.count == 1 { parameters["key"] = positions.removeFirst() }
         if ["click", "move"].contains(verb), positions.count == 2 { parameters["x"] = positions.removeFirst(); parameters["y"] = positions.removeFirst() }
         if verb == "drag", positions.count == 4 {
             for key in ["x", "y", "x2", "y2"] { parameters[key] = positions.removeFirst() }
@@ -237,6 +249,8 @@ final class CLI {
         guard positions.isEmpty else { throw Failure("Unexpected action arguments") }
         if args.flags.contains("double") { parameters["double"] = "true" }
         let timeout = try args.integer("timeout", default: 15, range: 1...120)
+        if verb == "terminal-open", !parameters.isEmpty { throw OutcomeFailure("TERMINAL_GUARD_INVALID", outcome: .noEffect) }
+        diagnosticPhase = "admission"
         _ = try store.load(name)
         let directory = try store.directory(name)
         // A scenario holding the run lease drives its own CLI actions with the same owner token;
@@ -249,11 +263,14 @@ final class CLI {
             throw Failure("Previous guest input operation is unresolved; reconcile retained lease evidence before dispatch")
         }
         let mailbox = try Mailbox(directory.appendingPathComponent("exchange"))
-        let request = Request(action: verb, arguments: parameters, timeout: Double(timeout))
+        let request = Request(action: wireVerb, arguments: parameters, timeout: Double(timeout))
         let imageName = "image-\(request.id.uuidString).png"
         defer { mailbox.remove(imageName) }
         if verb == "screenshot" || verb == "snapshot" { try mailbox.prepareSlot(imageName) }
+        diagnosticPhase = "dispatch"
+        dispatched = true
         let reply = try await mailbox.call(request)
+        diagnosticPhase = "output"
         var values = reply.values
         if verb == "screenshot" || verb == "snapshot" {
             guard values["image"] == imageName, let png = try mailbox.read(imageName, limit: 32 * 1024 * 1024) else { throw Failure("Invalid guest image response") }
@@ -262,6 +279,15 @@ final class CLI {
             values["image"] = output.path
         }
         try printJSON(values)
+        } catch {
+            guard structured else { throw error }
+            let diagnostic = ActionFailureDiagnostic(error: error, dispatched: dispatched, phase: diagnosticPhase)
+            let data = try JSONEncoder().encode(diagnostic)
+            print(String(decoding: data, as: UTF8.self))
+            // The top-level CLI handler must not echo a possibly sensitive
+            // original error after the sanitized envelope has been emitted.
+            throw Failure("ACTION_FAILED")
+        }
     }
     /// The agent skill shipped inside the app bundle, so its instructions match this version.
     /// Development builds outside a bundle fall back to the repository copy.
@@ -331,6 +357,10 @@ final class CLI {
     action --vm NAME key cmd+space
     action --vm NAME scroll --dy -300 [--dx 0 --x 640 --y 400]
     action --vm NAME clipboard-copy|clipboard-paste [--text TEXT]
+    action --vm NAME terminal-open     Launch only the guest's system Terminal app
+    action --vm NAME type|key ... --terminal-proof terminal-input/2 --terminal-pid PID --terminal-window TOKEN
+      Guarded input uses distinct wire verbs; a legacy helper cannot ignore the guard.
+      Terminal UI focus is not shell-prompt readiness. --structured-errors emits safe JSON errors.
       Legacy action NAME ACTION and default-target ACTION remain supported
       when unambiguous. Verb-named VMs and verb-like text require explicit syntax.
 

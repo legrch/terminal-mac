@@ -5,7 +5,8 @@ import Foundation
 public struct GuestActionTarget {
     public static let actions: Set<String> = [
         "status", "screenshot", "snapshot", "click", "move", "drag", "scroll",
-        "type", "key", "clipboard-paste", "clipboard-copy"
+        "type", "key", "clipboard-paste", "clipboard-copy",
+        "terminal-open", "terminal-type", "terminal-key"
     ]
 
     public let name: String
