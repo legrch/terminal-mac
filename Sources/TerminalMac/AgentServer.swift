@@ -197,7 +197,7 @@ final class AgentServer {
             throw Failure("No virtual Mac named '\(name)' exists yet. Ask the user to run `terminal-mac up\(name == "default" ? "" : " " + name)`; it downloads macOS and needs them for first-time setup.")
         }
         let directory = try store.directory(name)
-        guard CLI.isRunning(directory) else { throw Failure("VM '\(name)' is stopped. Ask the user to run: terminal-mac start \(name)") }
+        guard try CLI.isRunning(directory) else { throw Failure("VM '\(name)' is stopped. Ask the user to run: terminal-mac start \(name)") }
     }
     private func explain(_ error: Error) -> String {
         if let timeout = error as? MailboxTimeout, !timeout.pickedUp {

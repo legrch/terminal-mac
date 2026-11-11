@@ -30,7 +30,7 @@ extension CLI {
         // Re-read after acquiring the installation lock.
         let machine = FileManager.default.fileExists(atPath: directory.appendingPathComponent("machine.json").path) ? try store.load(name) : nil
         if machine?.installed != true {
-            guard !runtimeIsLocked(directory) else { throw Failure("An incomplete VM is running. Stop it before retrying installation.") }
+            guard !(try runtimeIsLocked(directory)) else { throw Failure("An incomplete VM is running. Stop it before retrying installation.") }
             let image: URL
             if let local = args.options["ipsw"] { image = URL(fileURLWithPath: (local as NSString).expandingTildeInPath) }
             else { image = try await cachedRestoreImage() }

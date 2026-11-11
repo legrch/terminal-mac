@@ -60,7 +60,7 @@ final class CLI {
             let machine = try store.load(name)
             guard machine.installed else { throw Failure("Installation did not complete. See the VM directory and README recovery instructions.") }
             let directory = try store.directory(name)
-            if runtimeIsLocked(directory) {
+            if try runtimeIsLocked(directory) {
                 if args.flags.contains("window") { _ = try await host(name, action: "show") }
                 if !quietStartup { try printJSON(["name": name, "state": "already-running"]) }; return
             }
@@ -98,7 +98,7 @@ final class CLI {
             let args = try Arguments(tail, flags: command == "stop" ? ["force"] : [], options: ["owner"])
             let name = try args.machineName()
             _ = try store.load(name)
-            if command == "status", !runtimeIsLocked(try store.directory(name)) {
+            if command == "status", !(try runtimeIsLocked(store.directory(name))) {
                 try printJSON(["name": name, "state": "stopped"]); return
             }
             var lifecycle = ["force": String(args.flags.contains("force"))]
@@ -147,7 +147,7 @@ final class CLI {
             let name = try args.machineName()
             var machine = try store.load(name)
             guard args.flags.count == 1 else { throw Failure("Usage: terminal-mac display [NAME] --hidpi|--standard") }
-            guard !runtimeIsLocked(try store.directory(name)) else { throw Failure("Stop the VM first: terminal-mac stop \(name). The display mode applies at the next boot.") }
+            guard !(try runtimeIsLocked(store.directory(name))) else { throw Failure("Stop the VM first: terminal-mac stop \(name). The display mode applies at the next boot.") }
             machine.scale = args.flags.contains("hidpi") ? 2 : 1
             try store.save(machine)
             try printJSON(["name": name, "display": "\(machine.width)×\(machine.height) points at \(machine.displayScale)x"])
@@ -163,7 +163,7 @@ final class CLI {
             case .held, .heldUnknown:
                 throw Failure("Guest input is locked; use a lease-holder action or wait for its completion")
             }
-            guard Self.isRunning(directory) else { throw Failure("VM is not running") }
+            guard try Self.isRunning(directory) else { throw Failure("VM is not running") }
             let mailbox = try Mailbox(directory.appendingPathComponent("exchange"))
             if tail[1] == "paste" { try await ClipboardBridge.paste(mailbox) }
             else { try await ClipboardBridge.copy(mailbox) }
@@ -201,7 +201,7 @@ final class CLI {
             let args = try Arguments(tail, flags: ["read-only"], options: ["protocol"])
             let name = try args.machineName()
             let machine = try store.load(name)
-            guard runtimeIsLocked(try store.directory(name)) else { throw Failure("VM '\(name)' is stopped. Start it with: terminal-mac start \(name)") }
+            guard try runtimeIsLocked(store.directory(name)) else { throw Failure("VM '\(name)' is stopped. Start it with: terminal-mac start \(name)") }
             let viewer = try TerminalViewer(directory: store.directory(name), machine: machine, graphics: args.options["protocol"], readOnly: args.flags.contains("read-only"))
             try await viewer.run()
         case "guest":
@@ -316,13 +316,9 @@ final class CLI {
         }
         return executableURL.path
     }
-    func runtimeIsLocked(_ directory: URL) -> Bool { Self.isRunning(directory) }
-    static func isRunning(_ directory: URL) -> Bool {
-        let fd = open(directory.appendingPathComponent("runtime.lock").path, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
-        guard fd >= 0 else { return false }
-        defer { close(fd) }
-        if flock(fd, LOCK_EX | LOCK_NB) == 0 { flock(fd, LOCK_UN); return false }
-        return true
+    func runtimeIsLocked(_ directory: URL) throws -> Bool { try Self.isRunning(directory) }
+    static func isRunning(_ directory: URL) throws -> Bool {
+        try RuntimeLock.isHeld(in: directory)
     }
     static let help = """
     terminal-mac — a separate macOS desktop for computer-use agents
