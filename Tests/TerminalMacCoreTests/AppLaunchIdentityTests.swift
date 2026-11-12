@@ -83,6 +83,34 @@ final class AppLaunchIdentityTests: XCTestCase {
         }
     }
 
+    func testTornCensusReadIsReobservedWithoutAdoptingPartialInventory() throws {
+        var reads = 0
+        let result = try AppLaunchIdentity.stableCensus {
+            reads += 1
+            if reads == 1 { throw AppLaunchIdentityError.censusChanged }
+            return self.census([self.root, self.primary])
+        }
+        XCTAssertEqual(reads, 2)
+        XCTAssertEqual(result.processes, [root, primary])
+    }
+    func testPersistentCensusChurnRemainsUnknownAfterBoundedReads() {
+        var reads = 0
+        expect(.censusChanged) {
+            _ = try AppLaunchIdentity.stableCensus {
+                reads += 1; throw AppLaunchIdentityError.censusChanged
+            }
+        }
+        XCTAssertEqual(reads, 8)
+    }
+    func testChangedOwnedIdentityIsNeverRetriedAsCensusChurn() {
+        var reads = 0
+        expect(.changedIdentity) {
+            _ = try AppLaunchIdentity.stableCensus {
+                reads += 1; throw AppLaunchIdentityError.changedIdentity
+            }
+        }
+        XCTAssertEqual(reads, 1)
+    }
     func testPlanDerivesNestedIdentityFromAcceptedMetadataNotProductPaths() throws {
         let value = try plan()
         XCTAssertEqual(value.outerExecutable, installed + "/Contents/MacOS/Start")

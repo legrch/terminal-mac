@@ -69,6 +69,13 @@ enum GuestProcessCensus {
     }
 
     static func capture() throws -> AppProcessCensus {
+        // Process creation during cold startup invalidates one READ snapshot,
+        // not the already-bound launch. Re-read a bounded complete census;
+        // never omit an unreadable process or repeat an application effect.
+        try AppLaunchIdentity.stableCensus { try captureOnce() }
+    }
+
+    private static func captureOnce() throws -> AppProcessCensus {
         try GuestGuard.requireVirtualMac()
         let before = try pids()
         var processes: [AppProcessSnapshot] = []

@@ -108,6 +108,18 @@ public enum AppLaunchIdentity {
     public static let maximumBundleProcesses = 256
     public static let maximumAncestry = 32
 
+    /// Bounded new read samples only. A changed process inventory is a known
+    /// torn read; all other errors, including changed owned identity, fail now.
+    public static func stableCensus(read: () throws -> AppProcessCensus) throws -> AppProcessCensus {
+        for attempt in 0..<8 {
+            do { return try read() }
+            catch AppLaunchIdentityError.censusChanged {
+                if attempt == 7 { throw AppLaunchIdentityError.censusChanged }
+            }
+        }
+        throw AppLaunchIdentityError.censusChanged
+    }
+
     private static func index(_ census: AppProcessCensus) throws -> [Int32: AppProcessSnapshot] {
         guard census.complete, census.processes.count <= maximumProcesses,
               census.applications.count <= maximumApplications else {

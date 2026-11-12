@@ -144,7 +144,7 @@ final class AppServiceMCPSession {
         guard var current = session else { throw Failure("MCP app session unavailable") }
         // Re-observe only a positively ACKed activation while its GUI becomes
         // visible. No mutating request is repeated; each read has a new UUID.
-        let until = ContinuousClock.now.advanced(by: .seconds(12))
+        let until = ContinuousClock.now.advanced(by: .seconds(60))
         var index = 0
         while true {
             let uuid = UUID().uuidString.lowercased()

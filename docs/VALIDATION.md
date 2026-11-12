@@ -106,3 +106,12 @@ verification. Pure tests cover the complete positive sequence and negative
 binding, deadline and unknown-outcome cases. This checkpoint is source/native
 qualification; it does not yet establish live MCP readiness or a successful
 installed application lifecycle in the current helper build.
+
+A subsequent cold guest run established launch-root/GUI-primary binding, but
+exposed process-inventory churn during a later complete census read. The native
+adapter now samples a bounded number of new complete read snapshots; it never
+omits an unreadable process or retries an application effect. Persistent churn
+and changed owned identity still fail. The updated source has 189 passing
+XCTest cases and a successful build13 package. The host application-session GUI
+wait is also bounded at 60 seconds within its original 600-second lifetime.
+These remain source qualification until a new guest lifecycle closes normally.
