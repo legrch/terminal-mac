@@ -132,6 +132,19 @@ enum GuestProcessCensus {
     /// `observe` / `observeApplications` validate each qualified observation
     /// BEFORE a torn census may be discarded, so evidence of a changed or new
     /// accepted identity in a sample that is later torn still fails at once.
+    /// The bounded torn-read sampler around one complete census. Each attempt
+    /// re-runs the caller's checks and the per-observation identity hooks, so an
+    /// observed violation fails at once instead of being resampled away.
+    static func stableCaptureForQuit(check: () throws -> Void,
+                                     observe: (AppProcessSnapshot) throws -> Void = { _ in },
+                                     observeApplications: ([AppGUIObservation]) throws -> Void = { _ in },
+                                     sampling injected: Sampling? = nil) throws -> AppProcessCensus {
+        try AppLaunchIdentity.stableCensus {
+            try captureForQuit(check: check, observe: observe,
+                               observeApplications: observeApplications, sampling: injected)
+        }
+    }
+
     static func captureForQuit(check: () throws -> Void,
                                observe: (AppProcessSnapshot) throws -> Void = { _ in },
                                observeApplications: ([AppGUIObservation]) throws -> Void = { _ in },
@@ -455,7 +468,11 @@ final class GuestApplicationLifecycle {
             throw AppLaunchIdentityError.exitUnconfirmed
         }
         quitInventoryReadAttempts += 1
-        let census = try GuestProcessCensus.captureForQuit(check: check)
+        // Same bounded torn-read sampler and identity hooks as the drain: a
+        // census torn by unrelated churn is re-read; an observed change fails.
+        let census = try GuestProcessCensus.stableCaptureForQuit(check: check,
+            observe: { try drain.requireAdmissible($0) },
+            observeApplications: { try drain.requireAdmissible(applications: $0) })
         try drain.requireQuiescent(root: rootObserver?.life() ?? .unknown,
                                    primary: primaryObserver?.life() ?? .unknown, census: census)
         try Task.checkCancellation()

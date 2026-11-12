@@ -166,4 +166,30 @@ final class GuestProcessSamplingTests: XCTestCase {
         }
     }
 
+
+    func testCloseCensusRereadsTornSamplesButKeepsObservedViolations() throws {
+        // pids differ between the start and end of the first two samples (torn),
+        // then settle. No process is enumerated, so per-observation hooks see none.
+        var pidReads = 0
+        let pids: [[Int32]] = [[42], [42, 43], [42], [42, 44], [42], [42]]
+        let info = bsd(), executable = expected.executable
+        let steadyBSD: (Int32) throws -> proc_bsdinfo? = { _ in info }
+        let steadyPath: (Int32) throws -> String = { _ in executable }
+        let churn = GuestProcessCensus.Sampling(requireGuest: {}, bsd: steadyBSD, path: steadyPath, pids: {
+            defer { pidReads += 1 }; return pids[pidReads]
+        }, applications: { [] }, uid: 501)
+        let census = try GuestProcessCensus.stableCaptureForQuit(check: {}, sampling: churn)
+        XCTAssertEqual(census.processes.map(\.key.pid), [42])
+        XCTAssertEqual(pidReads, 6)
+
+        // A violation seen inside a sample that is later torn still fails at once.
+        var reads = 0
+        let violating = GuestProcessCensus.Sampling(requireGuest: {}, bsd: steadyBSD, path: steadyPath, pids: {
+            defer { reads += 1 }; return reads == 0 ? [42] : [42, 43]
+        }, applications: { [] }, uid: 501)
+        XCTAssertThrowsError(try GuestProcessCensus.stableCaptureForQuit(check: {}, observe: { _ in
+            throw AppLaunchIdentityError.changedIdentity
+        }, sampling: violating)) { XCTAssertEqual($0 as? AppLaunchIdentityError, .changedIdentity) }
+        XCTAssertEqual(reads, 1)
+    }
 }
