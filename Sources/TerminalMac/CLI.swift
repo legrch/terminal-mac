@@ -365,18 +365,13 @@ final class CLI {
         }
         current = try await waitStopped(seconds: 10)
         guard current != "stopped" else { return ["state": "stopped", "guestDialogConfirmed": "false"] }
-        let lease = InputLease.admission(probe: try InputLease.probe(directory: directory), claimedOwner: nil)
         let mailbox = try Mailbox(directory.appendingPathComponent("exchange"))
-        let helper = try? await mailbox.call(Request(action: "status", timeout: 10))
-        guard GuestStopConfirmation.admissible(runtimeState: current, lease: lease,
-                                               helperAccessibility: helper?.values["accessibility"]) else {
-            throw Failure("Guest shutdown confirmation is not admissible (state \(current)); the stop request remains pending")
-        }
-        // One press, never retried. The guest may power off before its reply lands.
         var confirmed = "unconfirmed"
         do {
-            let pressed = try await mailbox.call(Request(action: GuestStopConfirmation.guestAction, timeout: 15))
-            confirmed = pressed.values["pressed"] == "true" ? "true" : "false"
+            _ = try await GuestStopConfirmation.attempt(directory: directory, mailbox: mailbox,
+                runtimeStatus: { try await self.host(name, action: "status").values },
+                guest: { try await mailbox.call($0) })
+            confirmed = "true"
         } catch {
             guard try await waitStopped(seconds: 60) == "stopped" else { throw error }
             return ["state": "stopped", "guestDialogConfirmed": "unconfirmed-reply"]

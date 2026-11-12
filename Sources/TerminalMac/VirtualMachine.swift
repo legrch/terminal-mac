@@ -111,6 +111,7 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
     let lock: Int32
     var window: NSWindow?
     var loop: Task<Void, Never>?
+    let generation = UUID().uuidString.lowercased()
     var stopping = false
     var stopDeadline: Date?
     /// Set when a requested guest shutdown has not powered off within the window.
@@ -188,7 +189,7 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
                 let artifacts = shares.compactMap { $0.directories["artifacts"] }
                 let expected = directory.appendingPathComponent("artifacts").standardizedFileURL
                 let readOnly = artifacts.count == 1 && artifacts[0].isReadOnly && artifacts[0].url.standardizedFileURL == expected
-                values = ["name": machine.name, "state": stateName, "pid": String(getpid()),
+                values = ["name": machine.name, "state": stateName, "pid": String(getpid()), "generation": generation,
                           "artifactShareReadOnly": String(readOnly), "artifactShareEvidence": "live-vz-configuration/1"]
             case "show":
                 windowOwner = request.arguments["leaseOwner"]

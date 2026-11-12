@@ -26,4 +26,58 @@ final class GuestStopConfirmationTests: XCTestCase {
         XCTAssertFalse(GuestStopConfirmation.isSystemShutdownButton(ownerBundle: nil, role: "AXButton", title: "Shut Down"))
         XCTAssertFalse(GuestStopConfirmation.isSystemShutdownButton(ownerBundle: "com.apple.loginwindow", role: "AXButton", title: "shut down"))
     }
+    func testLostPressReplyRetainsGenerationAttemptAndRefusesSecondCaller() async throws {
+        let directory = testTemporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let mailbox = try Mailbox(directory.appendingPathComponent("exchange"), create: true)
+        let generation = UUID().uuidString.lowercased()
+        var presses = 0
+        func press() async throws -> Reply {
+            try await GuestStopConfirmation.attempt(directory: directory, mailbox: mailbox,
+                runtimeStatus: { ["state": "stopping", "generation": generation] }, guest: { request in
+                    if request.action == "status" { return Reply(id: request.id, values: ["accessibility": "true"]) }
+                    presses += 1
+                    XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent("shutdown-confirmation-" + generation + ".json").path))
+                    throw MailboxTimeout(action: request.action, pickedUp: true)
+                })
+        }
+        do { _ = try await press(); XCTFail("Reply lost") } catch {}
+        do { _ = try await press(); XCTFail("Never repeat the press") } catch {}
+        XCTAssertEqual(presses, 1)
+        XCTAssertEqual(try InputLease.probe(directory: directory), .unresolved)
+        XCTAssertFalse(mailbox.helperUpdateDisposition().mayUpdate)
+    }
+
+    @MainActor
+    func testConcurrentConfirmationCallersPressOnlyOnce() async throws {
+        let directory = testTemporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let mailbox = try Mailbox(directory.appendingPathComponent("exchange"), create: true)
+        let generation = UUID().uuidString.lowercased()
+        var presses = 0
+        func press() async throws -> Reply {
+            try await GuestStopConfirmation.attempt(directory: directory, mailbox: mailbox,
+                runtimeStatus: { ["state": "stopping", "generation": generation] }, guest: { request in
+                    if request.action == "status" {
+                        try await Task.sleep(nanoseconds: 20_000_000)
+                        return Reply(id: request.id, values: ["accessibility": "true"])
+                    }
+                    presses += 1
+                    return Reply(id: request.id, values: ["pressed": "true"])
+                })
+        }
+        let first = Task { try await press() }
+        let second = Task { try await press() }
+        var successes = 0
+        for caller in [first, second] {
+            do { _ = try await caller.value; successes += 1 } catch {}
+        }
+        XCTAssertEqual(successes, 1)
+        XCTAssertEqual(presses, 1)
+        do { _ = try await press(); XCTFail("Confirmed press is still single-shot for this generation") } catch {}
+        XCTAssertEqual(presses, 1)
+    }
+
 }
