@@ -36,6 +36,32 @@ final class AppServiceTests: XCTestCase {
         try body(root)
     }
 
+    func testLiveLifetimeUsesElapsedTimeAcrossWallClockSync() throws {
+        var clock = try AppServiceTimebase(wallAnchor: now)
+        var record = try AppServiceRecord(open: command(), helperInstance: instance,
+                                           now: clock.sample(elapsed: 0))
+        try record.complete("open")
+        // A cloned VM may synchronize its wall clock by hours after open.
+        // Neither that wall time nor a later backward adjustment is an input.
+        let install = try command("install", sequence: 1)
+        try record.begin(install, now: clock.sample(elapsed: 1), activeOwner: owner)
+        try record.complete("install")
+        XCTAssertThrowsError(try record.begin(command("launch", sequence: 2),
+            now: clock.sample(elapsed: 600), activeOwner: owner))
+        // Expiry remains bounded and does not prevent explicit normal close.
+        try record.begin(command("close", sequence: 2),
+                         now: clock.sample(elapsed: 601), activeOwner: owner)
+    }
+
+    func testLiveTimebaseRefusesRegressionAndInvalidElapsedValues() throws {
+        var clock = try AppServiceTimebase(wallAnchor: now)
+        XCTAssertEqual(try clock.sample(elapsed: 5), now.addingTimeInterval(5))
+        for value in [-1.0, 4.0, Double.nan, Double.infinity] {
+            XCTAssertThrowsError(try clock.sample(elapsed: value))
+        }
+        XCTAssertThrowsError(try AppServiceTimebase(wallAnchor: Date(timeIntervalSince1970: .nan)))
+    }
+
     func testFiniteWireContractRejectsScriptCommandEnvironmentAndPaths() throws {
         let parsed = try command()
         XCTAssertEqual(parsed.runID, run)

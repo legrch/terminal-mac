@@ -16,6 +16,8 @@ final class GuestAppService {
     let exchange: URL
     let mailbox: Mailbox
     private var record: AppServiceRecord?
+    private var liveTimebase: AppServiceTimebase?
+    private var liveStart: ContinuousClock.Instant?
     private var payload: AppServicePayload?
     private var policy: AppVerificationPolicy?
     private var runDirectory: AppServiceDirectory?
@@ -37,6 +39,16 @@ final class GuestAppService {
         guard case .active(let actual) = mailbox.helperUpdateDisposition(), actual == owner else {
             throw AppServiceContract.refuse("APP_SERVICE_CUSTODY")
         }
+    }
+    private func liveNow() throws -> Date {
+        guard let liveStart, var clock = liveTimebase else {
+            throw AppServiceContract.refuse("APP_SERVICE_UNRESOLVED")
+        }
+        let elapsed = liveStart.duration(to: ContinuousClock.now).components
+        let value = try clock.sample(elapsed: Double(elapsed.seconds) +
+                                     Double(elapsed.attoseconds) / 1e18)
+        liveTimebase = clock
+        return value
     }
     private func store(_ value: AppServiceRecord, initial: Bool = false) throws {
         guard let runDirectory else { throw AppServiceContract.refuse("APP_SERVICE_UNRESOLVED") }
@@ -238,7 +250,9 @@ final class GuestAppService {
                 let directory = try root.child(command.runID, create: true, exclusive: true)
                 lock = held; runDirectory = directory; stageDirectory = stage; payload = selected; policy = acceptance.policy
                 lifecycle = nil; installedURL = nil; launchEvidencePublication = "not-attempted"
-                var next = try AppServiceRecord(open: command, helperInstance: instance, now: Date())
+                liveStart = ContinuousClock.now
+                liveTimebase = try AppServiceTimebase(wallAnchor: Date())
+                var next = try AppServiceRecord(open: command, helperInstance: instance, now: liveNow())
                 record = next
                 try directory.write(manifestBytes, named: "payload.json", createOnly: true)
                 try directory.write(acceptance.acceptedBytes, named: "accepted-application.json", createOnly: true)
@@ -251,7 +265,7 @@ final class GuestAppService {
             guard var next = record, let payload, let stageDirectory,
                   next.helperInstance == instance else { throw AppServiceContract.refuse("APP_SERVICE_UNRESOLVED") }
             // Begin is the same pure transition exercised by the Core tests.
-            try next.begin(command, now: Date(), activeOwner: command.owner)
+            try next.begin(command, now: liveNow(), activeOwner: command.owner)
             try check(request, owner: command.owner)
             // Known launch refusal happens before the durable dispatch intent
             // and before LaunchServices. It does not replace an installed app,

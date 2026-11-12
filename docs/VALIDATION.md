@@ -115,3 +115,22 @@ and changed owned identity still fail. The updated source has 189 passing
 XCTest cases and a successful build13 package. The host application-session GUI
 wait is also bounded at 60 seconds within its original 600-second lifetime.
 These remain source qualification until a new guest lifecycle closes normally.
+
+### Cold-clone clock synchronization checkpoint (November 12, 2026)
+
+Live helper13 runs reached MCP READY, rendered Farol Dev Setup/Home, accepted
+guest keys/text, and closed both original application processes normally. A
+separate native official 0.5.22 run installed into guest /Applications and
+completed Quit/relaunch/Quit/close with distinct primary PIDs and one observed
+window. These do not qualify Dev account/tunnel connectivity.
+
+A later cold clone accepted open then refused install as APP_SERVICE_EXPIRED
+within one host timestamp second. The guest record used wall-clock Date for
+its 600-second lifetime, so guest clock synchronization could shorten/extend
+the live budget. The compiled adapter now anchors a live-only timebase to
+ContinuousClock; persisted records remain non-adoptable and normal Quit/close
+remain permitted after expiry. The original failed run remains unresolved.
+191 XCTest cases pass, including expiry at elapsed 600 seconds, safe close,
+invalid/regressing elapsed values. Build14 packages successfully. Guest base
+permissions were re-confirmed through normal UI; fresh-clone live qualification
+of this timebase fix must be recorded separately.
