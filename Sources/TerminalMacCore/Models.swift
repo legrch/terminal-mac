@@ -145,7 +145,11 @@ public struct Store {
     public func load(_ name: String) throws -> Machine {
         let url = try directory(name).appendingPathComponent("machine.json")
         guard FileManager.default.fileExists(atPath: url.path) else { throw Failure("VM '\(name)' does not exist. Run terminal-mac create \(name) --ipsw /path/to/restore.ipsw") }
-        return try JSONDecoder().decode(Machine.self, from: Data(contentsOf: url))
+        let machine = try JSONDecoder().decode(Machine.self, from: Data(contentsOf: url))
+        guard machine.name == name else {
+            throw Failure("Interrupted rename: '\(name)' declares machine name '\(machine.name)'. Complete or undo it manually before using this machine.")
+        }
+        return machine
     }
     public func save(_ machine: Machine) throws {
         let data = try JSONEncoder().encode(machine)
@@ -165,6 +169,7 @@ public struct Store {
         guard FileManager.default.fileExists(atPath: source.appendingPathComponent("machine.json").path) else {
             throw Failure("VM '\(from)' does not exist")
         }
+        _ = try load(from)
         let destination = try directory(to)
         guard !FileManager.default.fileExists(atPath: destination.path) else {
             throw Failure("VM '\(to)' already exists; rename refuses collisions")

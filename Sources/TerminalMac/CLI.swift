@@ -5,7 +5,8 @@ import Darwin
 
 @MainActor
 final class CLI {
-    let store = Store()
+    let store: Store
+    init(store: Store = Store()) { self.store = store }
     var runtime: MachineRuntime?
     var guest: GuestRuntime?
     var executableURL: URL {

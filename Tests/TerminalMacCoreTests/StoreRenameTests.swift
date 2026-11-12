@@ -1,6 +1,7 @@
 import Foundation
 import XCTest
 @testable import TerminalMacCore
+@testable import TerminalMac
 
 // Stopped-machine rename: identity and guest data are preserved, the transaction is
 // recoverable, and running machines, held leases and collisions refuse safely.
@@ -83,7 +84,8 @@ final class StoreRenameTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("machines/pilot").path))
     }
 
-    func testInterruptedRenameIsDetectedInsteadOfAdopted() throws {
+    @MainActor
+    func testInterruptedRenameIsDetectedInsteadOfAdopted() async throws {
         let (store, root) = try store()
         // A half-finished earlier rename left the directory moved but the metadata behind.
         try machine("farol", in: root)
@@ -91,12 +93,20 @@ final class StoreRenameTests: XCTestCase {
         var drifted = try JSONDecoder().decode(Machine.self, from: Data(contentsOf: stale))
         drifted.name = "pilot"
         try JSONEncoder().encode(drifted).write(to: stale, options: .atomic)
+        XCTAssertThrowsError(try store.load("farol"))
+        for command in ["start", "__run"] {
+            do {
+                try await CLI(store: store).run([command, "farol"])
+                XCTFail("Interrupted identity must prevent startup")
+            } catch { XCTAssertTrue(error.localizedDescription.contains("Interrupted rename")) }
+        }
         XCTAssertThrowsError(try store.rename("farol", to: "final")) { error in
             XCTAssertTrue(String(describing: error).contains("Interrupted rename"),
                           "unexpected error: \(error)")
         }
         // The detected state is preserved for manual recovery, never silently adopted.
-        let detected = try JSONDecoder().decode(Machine.self, from: Data(contentsOf: root.appendingPathComponent("machines/final/machine.json")))
+        let detected = try JSONDecoder().decode(Machine.self, from: Data(contentsOf: root.appendingPathComponent("machines/farol/machine.json")))
         XCTAssertEqual(detected.name, "pilot")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("machines/final").path))
     }
 }
