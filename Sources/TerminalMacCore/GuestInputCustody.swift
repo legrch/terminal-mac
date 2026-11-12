@@ -12,6 +12,12 @@ public final class GuestInputCustody {
     private let location: URL
     private let borrowedReceipt: InputLease.MetadataReceipt?
     private var completed = false
+    private struct FenceReceipt {
+        let device: UInt64
+        let inode: UInt64
+        let bytes: Data
+    }
+    private var fenceReceipt: FenceReceipt?
 
     public static func begin(directory: URL, mailbox: Mailbox, request: Request,
                              claimedOwner: String? = nil) throws -> GuestInputCustody {
@@ -104,6 +110,9 @@ public final class GuestInputCustody {
             guard fsync(out) == 0, fsync(directory) == 0 else {
                 throw Failure("Guest operation fence publication is unconfirmed")
             }
+            var info = stat()
+            guard fstat(out, &info) == 0 else { throw Failure("Cannot identify published guest operation fence") }
+            fenceReceipt = FenceReceipt(device: UInt64(info.st_dev), inode: UInt64(info.st_ino), bytes: data)
         } catch { close(directory); throw error }
     }
     deinit { close(directory) }
@@ -121,10 +130,40 @@ public final class GuestInputCustody {
         try finishConfirmed()
         return result
     }
+    /// Completion authority belongs only to the exact record published before
+    /// this effect. Replaced or edited records remain unresolved evidence.
+    private func requireOriginalFence() throws {
+        guard let receipt = fenceReceipt else { throw Failure("Guest operation publication was not confirmed") }
+        let input = openat(directory, InputLease.operationName, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard input >= 0 else { throw Failure("Guest operation fence disappeared") }
+        defer { close(input) }
+        var info = stat()
+        guard fstat(input, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_nlink == 1,
+              UInt64(info.st_dev) == receipt.device, UInt64(info.st_ino) == receipt.inode,
+              info.st_size == receipt.bytes.count else { throw Failure("Guest operation fence was replaced") }
+        var data = Data(count: receipt.bytes.count)
+        try data.withUnsafeMutableBytes { bytes in
+            var offset = 0
+            while offset < bytes.count {
+                let count = Darwin.read(input, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+                if count < 0 && errno == EINTR { continue }
+                guard count > 0 else { throw Failure("Cannot verify guest operation fence") }
+                offset += count
+            }
+        }
+        var named = stat()
+        guard data == receipt.bytes,
+              fstatat(directory, InputLease.operationName, &named, AT_SYMLINK_NOFOLLOW) == 0,
+              UInt64(named.st_dev) == receipt.device, UInt64(named.st_ino) == receipt.inode else {
+            throw Failure("Guest operation fence changed; preserve custody")
+        }
+    }
+
     private func finishConfirmed() throws {
         do {
             try InputLease.withAdmission(directory: location) {
                 func removeFence() throws {
+                    try requireOriginalFence()
                     guard unlinkat(directory, InputLease.operationName, 0) == 0, fsync(directory) == 0 else {
                         throw Failure("Cannot durably release guest operation fence")
                     }

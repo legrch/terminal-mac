@@ -121,12 +121,13 @@ public final class InputLease {
     public func release(preserveMetadata: Bool = false, relocatedDirectory: URL? = nil) {
         guard !released else { return }
         released = true
-        // A borrowed native/CLI operation may still be in flight after its
+        // A cooperative CLI/MCP operation may still be in flight after its
         // original holder exits. Its durable fence owns both custody records.
         let location = relocatedDirectory ?? directory
         if !preserveMetadata || (try? Self.hasClosingFence(location)) == true {
             try? Self.withAdmission(directory: location, wait: true) {
                 guard try !Self.hasOperationFence(location) else { return }
+                guard let (_, actual) = Self.readMetadataRecord(location), actual == metadataReceipt else { return }
                 let closing = try Self.closingMatches(directory: location, owner: owner)
                 guard !preserveMetadata || closing else { return }
                 if closing {
@@ -157,7 +158,8 @@ public final class InputLease {
     }
 
     /// Short cross-process admission barrier shared by operation publication,
-    /// marker teardown and metadata release. Never wait behind another client.
+    /// marker teardown and metadata release. Dispatch refuses contention;
+    /// teardown waits only for this short section, never for a guest effect.
     static func withAdmission<T>(directory: URL, wait: Bool = false, _ body: () throws -> T) throws -> T {
         let fd = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { throw Failure("Cannot open input admission directory") }
@@ -446,7 +448,7 @@ public final class InputLease {
         let out = openat(directoryFD, closingName, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard out >= 0 else { throw Failure("Cannot publish input closing intent; preserve custody") }
         defer { close(out) }
-        let data = Data(owner.utf8)
+        let data = try JSONEncoder().encode(["schema": "terminal-mac.input-closing/1", "owner": owner])
         try data.withUnsafeBytes { bytes in
             var offset = 0
             while offset < bytes.count {
@@ -459,8 +461,9 @@ public final class InputLease {
         guard fsync(out) == 0, fsync(directoryFD) == 0 else { throw Failure("Input closing intent durability is unconfirmed") }
     }
     static func closingMatches(directory: URL, owner: String) throws -> Bool {
-        guard let data = try Mailbox(directory).read(closingName, limit: 128) else { return false }
-        guard data == Data(owner.utf8) else { throw Failure("Input closing owner changed; preserve custody") }
+        guard let data = try Mailbox(directory).read(closingName, limit: 4096) else { return false }
+        let record = try JSONSerialization.jsonObject(with: data) as? [String: String]
+        guard record == ["schema": "terminal-mac.input-closing/1", "owner": owner] else { throw Failure("Input closing owner changed; preserve custody") }
         return true
     }
     private static func removeClosing(directory: URL) throws {

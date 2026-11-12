@@ -171,4 +171,50 @@ final class CLIInputCustodyTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: metadata.path))
     }
 
+    func testConfirmedBorrowerCannotClearSubstitutedOperationFence() async throws {
+        for replaceInode in [true, false] {
+            let (_, directory, box) = try fixture()
+            let holder = try InputLease.acquire(directory: directory, owner: "scenario", generation: 1)
+            try box.publishLeaseFlag(owner: holder.owner, ttl: 120)
+            let operation = try GuestInputCustody.begin(directory: directory, mailbox: box,
+                request: Request(action: "key"), claimedOwner: holder.owner)
+            let fence = directory.appendingPathComponent(InputLease.operationName)
+            var bytes = try Data(contentsOf: fence)
+            if !replaceInode { bytes[bytes.count - 1] = 0x5d }
+            do {
+                try await operation.perform {
+                    holder.release(preserveMetadata: true)
+                    if replaceInode { try bytes.write(to: fence, options: .atomic) }
+                    else {
+                        let file = try FileHandle(forWritingTo: fence)
+                        defer { try? file.close() }
+                        try file.write(contentsOf: bytes)
+                        try file.synchronize()
+                    }
+                }
+                XCTFail("A substituted or edited operation record is not ours to clear")
+            } catch {}
+            XCTAssertEqual(try? Data(contentsOf: fence), bytes)
+            XCTAssertFalse(box.helperUpdateDisposition().mayUpdate)
+            XCTAssertEqual(try InputLease.probe(directory: directory), .unresolved)
+        }
+    }
+
+    func testClosingHolderCannotRemoveMarkerAfterMetadataSubstitution() async throws {
+        let (_, directory, box) = try fixture()
+        let holder = try InputLease.acquire(directory: directory, owner: "scenario", generation: 1)
+        try box.publishLeaseFlag(owner: holder.owner, ttl: 120)
+        let operation = try GuestInputCustody.begin(directory: directory, mailbox: box,
+            request: Request(action: "key"), claimedOwner: holder.owner)
+        try await operation.perform {
+            XCTAssertThrowsError(try box.releaseLeaseFlag(ownedBy: holder.owner))
+        }
+        let metadata = directory.appendingPathComponent(InputLease.metadataName)
+        let bytes = try Data(contentsOf: metadata)
+        try bytes.write(to: metadata, options: .atomic)
+        holder.release(preserveMetadata: true)
+        XCTAssertFalse(box.helperUpdateDisposition().mayUpdate)
+        XCTAssertEqual(try InputLease.probe(directory: directory), .unresolved)
+    }
+
 }

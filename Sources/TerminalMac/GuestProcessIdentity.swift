@@ -123,10 +123,10 @@ enum GuestProcessCensus {
     /// joins live PIDs; reusing that join here would hide delayed registry
     /// removal and could falsely attest a completely drained application.
     ///
-    /// This is one complete read attempt. An unreadable/torn process sample is
-    /// never downgraded to a positive survivor, omitted, or retried by the Quit
-    /// drain loop. The caller's original deadline/cancellation/custody check
-    /// runs throughout the bounded enumeration.
+    /// This is one complete read attempt. PID-list churn may be resampled by
+    /// the caller; forbidden identity observations fail permanently. Unreadable
+    /// processes are never omitted or called positive survivors. The original
+    /// deadline/cancellation/custody check runs throughout enumeration.
     /// `observe` / `observeApplications` validate each qualified observation
     /// BEFORE a torn census may be discarded, so evidence of a changed or new
     /// accepted identity in a sample that is later torn still fails at once.
