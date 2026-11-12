@@ -34,22 +34,19 @@ enum ClipboardBridge {
 }
 
 /// Native-window transfers use the same durable custody as CLI/MCP dispatch.
-/// The window may borrow its deliberate holder's lease, but cannot adopt a
-/// foreign owner or reset an unknown result when the shortcut task ends.
+/// Transfers acquire their own lease and refuse even a deliberate window
+/// holder. Unknown outcomes remain fenced after the shortcut task ends.
 @MainActor
 final class NativeClipboardCustody {
     private let directory: URL
-    private let windowOwner: () -> String?
     private let nativeOwner = "native:" + UUID().uuidString.lowercased()
     private var outcome = GuestSessionOutcomeGuard()
     var isUnconfirmed: Bool { outcome.isUnconfirmed }
-    init(directory: URL, windowOwner: @escaping () -> String?) {
-        self.directory = directory; self.windowOwner = windowOwner
-    }
+    init(directory: URL) { self.directory = directory }
     func perform(request: Request, mailbox: Mailbox, effect: () async throws -> Void) async throws {
         try outcome.requireAllowed(action: request.action)
         let custody = try GuestInputCustody.begin(directory: directory, mailbox: mailbox,
-            request: request, claimedOwner: windowOwner() ?? nativeOwner)
+            request: request, claimedOwner: nativeOwner)
         do { try await custody.perform(effect) }
         catch {
             if InputQueue.disposition(for: error) == .stop { outcome.markUnconfirmed() }

@@ -157,7 +157,7 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
         NSApp.setActivationPolicy(.regular)
         let view = ClipboardMachineView(frame: NSRect(x: 0, y: 0, width: machine.width, height: machine.height))
         view.clipboardMailbox = guestMailbox
-        view.clipboardCustody = NativeClipboardCustody(directory: directory, windowOwner: { [weak self] in self?.windowOwner })
+        view.clipboardCustody = NativeClipboardCustody(directory: directory)
         view.virtualMachine = vm
         view.capturesSystemKeys = false
         view.inputGate = { [weak self] in

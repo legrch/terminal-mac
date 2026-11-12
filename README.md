@@ -156,7 +156,11 @@ guest helper defers self-replacement while a marker exists, even after expiry. T
 do not authenticate the owner token. Standalone mutations acquire custody through dispatch;
 cooperative owner calls also publish a durable `input-operation.json` fence before effects.
 Unknown results retain that fence and both custody records for explicit reconciliation,
-including when the original holder exits. Older installed helpers and clients require
+including when the original holder exits. Cooperative calls require the holder's
+existing helper-update marker and cannot reopen admission after teardown begins.
+A closing holder publishes `input-closing.json` while an operation is outstanding;
+confirmed completion reconciles only the original metadata inode and bytes under
+the shared admission lock. Unknown completion retains all evidence. Older installed helpers and clients require
 separate compatibility verification.
 
 The agent instructions are in [docs/AGENT.md](docs/AGENT.md). No global agent settings are modified.
@@ -191,7 +195,9 @@ host clipboard unchanged before a host write is attempted. Paste captures the te
 the command is received, before waiting in an input queue; Copy checks the initiating
 host clipboard revision again immediately before writing. This is not an atomic
 conditional write: another process can still race that local OS operation. Native
-shortcut errors beep and appear in the VM runtime log.
+shortcut errors beep and appear in the VM runtime log. Native clipboard transfers
+acquire their own input lease and are refused while any viewer, MCP agent or scenario
+holds it, including an owner that deliberately opened the native window.
 
 In the terminal viewer, **Ctrl+G**, then **V** pastes host text; **Ctrl+G**, then **C** copies
 selected guest text to the host. Command-line equivalents:

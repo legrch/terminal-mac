@@ -13,7 +13,7 @@ final class NativeClipboardCustodyTests: XCTestCase {
     }
     func testLostNativePasteReplyFencesFurtherTransfersAndOtherClients() async throws {
         let (directory, mailbox) = try fixture()
-        let session = NativeClipboardCustody(directory: directory, windowOwner: { nil })
+        let session = NativeClipboardCustody(directory: directory)
         let request = Request(action: "clipboard-paste", timeout: 0.01)
         do {
             try await session.perform(request: request, mailbox: mailbox) {
@@ -38,7 +38,7 @@ final class NativeClipboardCustodyTests: XCTestCase {
     func testCancellationAndMutationUnknownRetainNativeCustody() async throws {
         for failure: Error in [CancellationError(), OutcomeFailure("unconfirmed", outcome: .mutationUnknown)] {
             let (directory, mailbox) = try fixture()
-            let session = NativeClipboardCustody(directory: directory, windowOwner: { nil })
+            let session = NativeClipboardCustody(directory: directory)
             do {
                 try await session.perform(request: Request(action: "clipboard-copy"), mailbox: mailbox) { throw failure }
                 XCTFail("Unknown effect")
@@ -48,44 +48,43 @@ final class NativeClipboardCustodyTests: XCTestCase {
             XCTAssertFalse(mailbox.helperUpdateDisposition().mayUpdate)
         }
     }
-    func testNativeTransferBorrowsWindowOwnerAndReleasesOnlyItsOperation() async throws {
+    func testNativeTransferRefusesEvenDeliberateWindowOwnerLease() async throws {
         let (directory, mailbox) = try fixture()
         let holder = try InputLease.acquire(directory: directory, owner: "viewer", generation: 1)
         defer { holder.release() }
         try mailbox.publishLeaseFlag(owner: holder.owner, ttl: 120)
-        let session = NativeClipboardCustody(directory: directory, windowOwner: { holder.owner })
-        var dispatched = 0
-        try await session.perform(request: Request(action: "clipboard-copy"), mailbox: mailbox) { dispatched += 1 }
-        XCTAssertEqual(dispatched, 1)
-        XCTAssertEqual(try InputLease.probe(directory: directory), .held(owner: holder.owner, generation: 1))
-        XCTAssertFalse(mailbox.helperUpdateDisposition().mayUpdate)
-        let foreign = NativeClipboardCustody(directory: directory, windowOwner: { "foreign" })
+        let session = NativeClipboardCustody(directory: directory)
+        var dispatched = false
         do {
-            try await foreign.perform(request: Request(action: "clipboard-paste"), mailbox: mailbox) { dispatched += 1 }
-            XCTFail("Foreign custody must be refused")
-        } catch {}
-        XCTAssertEqual(dispatched, 1)
+            try await session.perform(request: Request(action: "clipboard-copy"), mailbox: mailbox) { dispatched = true }
+            XCTFail("Native clipboard must not borrow the deliberate window owner's lease")
+        } catch { XCTAssertTrue(error is LeaseConflict) }
+        XCTAssertFalse(dispatched)
+        XCTAssertFalse(session.isUnconfirmed)
+        XCTAssertFalse(try InputLease.hasOperationFence(directory))
+        XCTAssertEqual(try InputLease.probe(directory: directory), .held(owner: holder.owner, generation: 1))
         try mailbox.releaseLeaseFlag(ownedBy: holder.owner)
     }
-    func testBorrowedNativeUnknownSurvivesWindowHolderRelease() async throws {
+    func testNativeRefusalThenHolderExitLeavesNoOrphanCustody() async throws {
         let (directory, mailbox) = try fixture()
         let holder = try InputLease.acquire(directory: directory, owner: "viewer", generation: 1)
         try mailbox.publishLeaseFlag(owner: holder.owner, ttl: 120)
-        let session = NativeClipboardCustody(directory: directory, windowOwner: { holder.owner })
+        let session = NativeClipboardCustody(directory: directory)
+        var dispatched = 0
         do {
-            try await session.perform(request: Request(action: "clipboard-paste"), mailbox: mailbox) {
-                // The original viewer can exit while its recovery window is transferring.
-                XCTAssertThrowsError(try mailbox.releaseLeaseFlag(ownedBy: holder.owner))
-                holder.release()
-                XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent(InputLease.metadataName).path))
-                throw OutcomeFailure("lost native result", outcome: .mutationUnknown)
-            }
-            XCTFail("Unknown native outcome")
+            try await session.perform(request: Request(action: "clipboard-paste"), mailbox: mailbox) { dispatched += 1 }
+            XCTFail("No borrowed transfer may start")
         } catch {}
-        XCTAssertTrue(session.isUnconfirmed)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent(InputLease.metadataName).path))
-        XCTAssertFalse(mailbox.helperUpdateDisposition().mayUpdate)
-        XCTAssertThrowsError(try InputLease.acquire(directory: directory, owner: "next", generation: 2))
+        try mailbox.releaseLeaseFlag(ownedBy: holder.owner)
+        holder.release()
+        XCTAssertEqual(dispatched, 0)
+        try await session.perform(request: Request(action: "clipboard-copy"), mailbox: mailbox) {
+            dispatched += 1
+            XCTAssertFalse(mailbox.helperUpdateDisposition().mayUpdate)
+            XCTAssertTrue(try InputLease.hasOperationFence(directory))
+        }
+        XCTAssertEqual(dispatched, 1)
+        XCTAssertEqual(try InputLease.probe(directory: directory), .free)
+        XCTAssertEqual(mailbox.helperUpdateDisposition(), .unmarked)
     }
-
 }
