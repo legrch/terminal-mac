@@ -174,6 +174,14 @@ public struct AppQuitDrain {
         }
     }
 
+    /// Raw kernel key check, applied to every successful BSD read before any
+    /// further fallible read: a known PID with another start or UID is a change.
+    public func requireAdmissible(key: AppProcessKey, uid: UInt32) throws {
+        if let expected = known[key.pid], expected.key != key || expected.uid != uid {
+            throw AppLaunchIdentityError.changedIdentity
+        }
+    }
+
     public func requireAdmissible(applications: [AppGUIObservation]) throws {
         for app in applications {
             let relevant = known[app.pid] != nil || plan.contains(app.executable) ||

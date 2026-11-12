@@ -192,4 +192,41 @@ final class GuestProcessSamplingTests: XCTestCase {
         }, sampling: violating)) { XCTAssertEqual($0 as? AppLaunchIdentityError, .changedIdentity) }
         XCTAssertEqual(reads, 1)
     }
+
+    func testReusedKnownKeyThatVanishesBeforePathQualificationIsStillReported() throws {
+        // Counterexample from review: BSD shows a replacement identity for a known
+        // PID, the path read fails, and the probe then finds the process gone.
+        var bsdReads = 0
+        let replacement = bsd(seconds: 200, micros: 1)
+        let sampling = GuestProcessCensus.Sampling(requireGuest: {}, bsd: { _ in
+            defer { bsdReads += 1 }; return bsdReads == 0 ? replacement : nil
+        }, path: { _ in throw AppLaunchIdentityError.censusUnavailable },
+        pids: { [42] }, applications: { [] }, uid: 501)
+        let known = expected
+        XCTAssertThrowsError(try GuestProcessCensus.stableCaptureForQuit(check: {}, observeKey: { key, uid in
+            if key.pid == known.key.pid, key != known.key || uid != known.uid {
+                throw AppLaunchIdentityError.changedIdentity
+            }
+        }, sampling: sampling)) { XCTAssertEqual($0 as? AppLaunchIdentityError, .changedIdentity) }
+        XCTAssertEqual(bsdReads, 1)
+    }
+
+    func testObserverPoisonsWhenAReplacementVanishesBeforePathQualification() throws {
+        var bsdReads = 0
+        let replacement = bsd(seconds: 200, micros: 1)
+        let source = GuestProcessCensus.Sampling(requireGuest: {}, bsd: { _ in
+            defer { bsdReads += 1 }; return bsdReads == 0 ? replacement : nil
+        }, path: { _ in throw AppLaunchIdentityError.censusUnavailable },
+        pids: { [42] }, applications: { [] }, uid: 501)
+        let original = expected
+        var didExit = false
+        let observer = GuestOriginalProcessObserver(original, sample: {
+            try GuestProcessCensus.process(42, sampling: source, observeKey: { key, uid in
+                guard key == original.key, uid == original.uid else { throw AppLaunchIdentityError.changedIdentity }
+            })
+        }, originalExit: { didExit })
+        XCTAssertEqual(observer.life(), .unknown)
+        didExit = true
+        XCTAssertEqual(observer.life(), .unknown)   // poisoned for good, never exited
+    }
 }

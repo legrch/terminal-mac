@@ -169,6 +169,16 @@ final class AppQuitDrainTests: XCTestCase {
         }
     }
 
+    func testRawKernelKeyAdmissionRejectsReusedKnownPID() throws {
+        let (_, _, _, drain) = try fixture()
+        XCTAssertNoThrow(try drain.requireAdmissible(key: helper.key, uid: helper.uid))
+        XCTAssertNoThrow(try drain.requireAdmissible(key: AppProcessKey(pid: 900, startSeconds: 1, startMicroseconds: 0), uid: 501))
+        expect(.changedIdentity) {
+            try drain.requireAdmissible(key: AppProcessKey(pid: helper.key.pid, startSeconds: 101, startMicroseconds: 0), uid: helper.uid)
+        }
+        expect(.changedIdentity) { try drain.requireAdmissible(key: helper.key, uid: 502) }
+    }
+
     func testPerObservationAdmissionRejectsChangedOrNewAcceptedIdentity() throws {
         let (_, _, _, drain) = try fixture()
         XCTAssertNoThrow(try drain.requireAdmissible(helper))
