@@ -46,7 +46,9 @@ enum GuestProcessCensus {
         let size = Int32(MemoryLayout<proc_bsdinfo>.size)
         let count = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size)
         if count <= 0 && errno == ESRCH { return nil }
-        guard count == size, info.pbi_pid == UInt32(pid), info.pbi_start_tvsec > 0,
+        guard count == size else { throw AppLaunchIdentityError.censusUnavailable }
+        guard info.pbi_pid == UInt32(pid) else { throw AppLaunchIdentityError.changedIdentity }
+        guard info.pbi_start_tvsec > 0,
               info.pbi_start_tvusec < 1_000_000, info.pbi_ppid <= UInt32(Int32.max) else {
             throw AppLaunchIdentityError.censusUnavailable
         }
@@ -72,7 +74,7 @@ enum GuestProcessCensus {
         guard pid > 0 else { throw AppLaunchIdentityError.censusUnavailable }
         guard let before = try sampling.bsd(pid) else { return nil }
         // A process that exits between reads is absent, not changed. Only a
-        // live process whose identity differs between reads is censusChanged.
+        // live process whose identity differs between reads is changedIdentity.
         func pathOrAbsent() throws -> String? {
             do { return try sampling.path(pid) } catch {
                 if (try sampling.bsd(pid)) == nil { return nil }
@@ -85,10 +87,11 @@ enum GuestProcessCensus {
         // Parent PID is ancestry, not identity (AppLaunchIdentity excludes it):
         // a parent exiting mid-read reparents the child and must not poison it.
         // The latest parent is reported; start, UID and executable must hold.
-        guard before.pbi_start_tvsec == after.pbi_start_tvsec,
+        guard before.pbi_pid == UInt32(pid), after.pbi_pid == UInt32(pid),
+              before.pbi_start_tvsec == after.pbi_start_tvsec,
               before.pbi_start_tvusec == after.pbi_start_tvusec,
               before.pbi_uid == after.pbi_uid,
-              executable == again else { throw AppLaunchIdentityError.censusChanged }
+              executable == again else { throw AppLaunchIdentityError.changedIdentity }
         return AppProcessSnapshot(
             key: AppProcessKey(pid: pid, startSeconds: after.pbi_start_tvsec,
                                startMicroseconds: UInt32(after.pbi_start_tvusec)),
@@ -140,10 +143,11 @@ enum GuestProcessCensus {
         for pid in before {
             try Task.checkCancellation()
             try check()
-            guard let process = try GuestProcessCensus.process(pid, sampling: sampling), process.uid == sampling.uid else {
+            guard let process = try GuestProcessCensus.process(pid, sampling: sampling) else {
                 throw AppLaunchIdentityError.censusChanged
             }
             try observe(process)
+            guard process.uid == sampling.uid else { throw AppLaunchIdentityError.changedIdentity }
             processes.append(process)
         }
         // Do not filter by PID membership, isTerminated or activationPolicy:
@@ -162,9 +166,10 @@ enum GuestProcessCensus {
         let before = try pids()
         var processes: [AppProcessSnapshot] = []
         for pid in before {
-            guard let process = try GuestProcessCensus.process(pid), process.uid == geteuid() else {
+            guard let process = try GuestProcessCensus.process(pid) else {
                 throw AppLaunchIdentityError.censusChanged
             }
+            guard process.uid == geteuid() else { throw AppLaunchIdentityError.changedIdentity }
             processes.append(process)
         }
         // Do not silently omit an unreadable or newly appearing current-user
@@ -265,7 +270,7 @@ final class GuestOriginalProcessObserver {
             // observed without repeating any process operation.
             if let actual, !actual.sameProcess(as: expected) { invalid = true }
             return life
-        } catch AppLaunchIdentityError.censusChanged {
+        } catch let error as AppLaunchIdentityError where error == .censusChanged || error == .changedIdentity {
             // A live identity transition was observed: poison, never wait it out.
             invalid = true; return .unknown
         } catch { return .exitPending }
