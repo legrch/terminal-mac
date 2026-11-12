@@ -228,6 +228,8 @@ final class GuestApplicationLifecycle {
     private var quitDrain: AppQuitDrain?
     private var quitProgress: AppQuitDrainProgress?
     private var quitInventoryReadAttempts = 0
+    /// Last quit step entered; a diagnostic label only, never authority.
+    private var quitStep = "not-started"
 
     init(plan: AppLaunchPlan, before: AppProcessCensus, notBefore: AppProcessKey) {
         self.plan = plan; self.before = before; self.notBefore = notBefore
@@ -307,6 +309,7 @@ final class GuestApplicationLifecycle {
         guard !quitIssued, let binding, let returnedProcess, failure == nil else {
             throw AppLaunchIdentityError.exitUnconfirmed
         }
+        quitStep = "pre-effect-admission"
         try Task.checkCancellation()
         try check()
         let primaryLife = primaryObserver?.life() ?? .unknown
@@ -323,9 +326,11 @@ final class GuestApplicationLifecycle {
         // at launch. Every sample retains the original request checks; no
         // partial census is accepted and no application effect is repeated.
         // Post-terminate drain/close observations remain strict single reads.
+        quitStep = "pre-effect-census"
         let beforeQuit = try AppLaunchIdentity.stableCensus {
             try GuestProcessCensus.captureForQuit(check: check)
         }
+        quitStep = "pre-effect-binding"
         let confirmed = try AppLaunchIdentity.bind(plan: plan, before: before,
             after: beforeQuit, returned: returnedProcess.key, notBefore: notBefore, uid: geteuid())
         try AppLaunchIdentity.requireSameBinding(binding, confirmed)
@@ -333,6 +338,7 @@ final class GuestApplicationLifecycle {
         quitDrain = drain
         quitProgress = nil
         quitInventoryReadAttempts = 0
+        quitStep = "terminate-admission"
 
         try await drain.run(check: check, terminatePrimary: {
             guard !self.quitIssued, !app.isTerminated,
@@ -341,12 +347,14 @@ final class GuestApplicationLifecycle {
                 throw AppLaunchIdentityError.changedIdentity
             }
             self.quitIssued = true  // Even a false return is never retried.
+            self.quitStep = "drain-originals"
             return app.terminate()   // The only normal termination request.
         }, originals: {
             (root: self.rootObserver?.life() ?? .unknown,
              primary: self.primaryObserver?.life() ?? .unknown)
         }, inventory: {
             self.quitInventoryReadAttempts += 1
+            self.quitStep = "drain-inventory"
             return try GuestProcessCensus.captureForQuit(check: check)
         }, nextObservation: {
             // Scheduling cadence ONLY. Each new sample rechecks the original
@@ -355,6 +363,7 @@ final class GuestApplicationLifecycle {
         }, observed: { progress in
             self.quitProgress = progress
         })
+        quitStep = "quiescent"
         try check()
     }
 
@@ -403,6 +412,7 @@ final class GuestApplicationLifecycle {
             "normalQuitRequested": String(quitIssued)
         ]
         values["quitInventoryReadAttempts"] = String(quitInventoryReadAttempts)
+        values["quitStep"] = quitStep
         switch quitProgress {
         case .some(.originalExitsPending(_, _)):
             values["quitDrainState"] = "original-exits-pending"
@@ -410,6 +420,9 @@ final class GuestApplicationLifecycle {
             values["quitDrainState"] = "accepted-inventory-pending"
             values["quitResidualProcesses"] = String(processes)
             values["quitResidualApplications"] = String(applications)
+        case .some(.inventoryUnobserved(let tornSamples)):
+            values["quitDrainState"] = "accepted-inventory-unobserved"
+            values["quitTornSamples"] = String(tornSamples)
         case .some(.quiescent):
             values["quitDrainState"] = "observed-quiescent"
             values["quitResidualProcesses"] = "0"

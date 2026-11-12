@@ -376,9 +376,9 @@ final class AppQuitDrainTests: XCTestCase {
     }
 
     @MainActor
-    func testUnreadableTornOrChangedInventoryErrorIsNotCaughtAsWaitable() async throws {
+    func testUnreadableOrChangedIdentityInventoryErrorIsNotCaughtAsWaitable() async throws {
         let (_, _, _, drain) = try fixture()
-        for expected in [AppLaunchIdentityError.censusUnavailable, .censusChanged, .changedIdentity] {
+        for expected in [AppLaunchIdentityError.censusUnavailable, .changedIdentity, .unrelatedRoot] {
             var effects = 0, inventories = 0, waits = 0
             do {
                 try await drain.run(check: {}, terminatePrimary: { effects += 1; return true },
@@ -388,6 +388,80 @@ final class AppQuitDrainTests: XCTestCase {
             } catch { XCTAssertEqual(error as? AppLaunchIdentityError, expected) }
             XCTAssertEqual(effects, 1); XCTAssertEqual(inventories, 1); XCTAssertEqual(waits, 0)
         }
+    }
+
+    @MainActor
+    func testPostTerminateTornReadThatSettlesReachesQuiescenceWithOneTermination() async throws {
+        // Teardown churn: the first samples see the PID list change mid-read.
+        let (_, _, _, drain) = try fixture()
+        var effects = 0, inventories = 0, waits = 0
+        var observations: [AppQuitDrainProgress] = []
+        try await drain.run(check: {}, terminatePrimary: { effects += 1; return true },
+            originals: { effects == 0 ? (.running, .running) : (.exited, .exited) },
+            inventory: {
+                inventories += 1
+                if inventories <= 3 { throw AppLaunchIdentityError.censusChanged }
+                return self.census()
+            }, nextObservation: { waits += 1 }, observed: { observations.append($0) })
+        XCTAssertEqual(effects, 1)
+        XCTAssertEqual(inventories, 4)   // re-sampled inside one bounded observation
+        XCTAssertEqual(waits, 0)
+        XCTAssertEqual(observations, [.quiescent])
+    }
+
+    @MainActor
+    func testTornSampleExhaustionIsUnobservedNotSurvivorAndWaitsForNextObservation() async throws {
+        let (_, _, _, drain) = try fixture()
+        var effects = 0, inventories = 0, waits = 0
+        var observations: [AppQuitDrainProgress] = []
+        try await drain.run(check: {}, terminatePrimary: { effects += 1; return true },
+            originals: { effects == 0 ? (.running, .running) : (.exited, .exited) },
+            inventory: {
+                inventories += 1
+                if waits == 0 { throw AppLaunchIdentityError.censusChanged }
+                return self.census()
+            }, nextObservation: { waits += 1 }, observed: { observations.append($0) })
+        XCTAssertEqual(effects, 1)
+        XCTAssertEqual(inventories, 9)   // 8 bounded torn samples, then one clean read
+        XCTAssertEqual(waits, 1)
+        XCTAssertEqual(observations, [.inventoryUnobserved(tornSamples: 1), .quiescent])
+    }
+
+    @MainActor
+    func testTornReadsUntilOriginalDeadlineFailWithoutCompletionOrAnotherTermination() async throws {
+        let (_, _, _, drain) = try fixture()
+        var effects = 0, inventories = 0, waits = 0
+        var observations: [AppQuitDrainProgress] = []
+        do {
+            try await drain.run(check: {
+                if waits >= 3 { throw TestStop.originalDeadline }
+            }, terminatePrimary: { effects += 1; return true },
+            originals: { effects == 0 ? (.running, .running) : (.exited, .exited) },
+            inventory: { inventories += 1; throw AppLaunchIdentityError.censusChanged },
+            nextObservation: { waits += 1 }, observed: { observations.append($0) })
+            XCTFail("a never-settling census must not complete")
+        } catch { XCTAssertEqual(error as? TestStop, .originalDeadline) }
+        XCTAssertEqual(effects, 1)
+        XCTAssertEqual(inventories, 24)
+        XCTAssertFalse(observations.contains(.quiescent))
+        XCTAssertEqual(observations.last, .inventoryUnobserved(tornSamples: 3))
+    }
+
+    @MainActor
+    func testTornReadThenChangedOriginalIdentityStillFailsImmediately() async throws {
+        let (_, _, _, drain) = try fixture()
+        var effects = 0, inventories = 0
+        do {
+            try await drain.run(check: {}, terminatePrimary: { effects += 1; return true },
+                originals: { effects == 0 ? (.running, .running) : (.exited, .exited) },
+                inventory: {
+                    inventories += 1
+                    if inventories == 1 { throw AppLaunchIdentityError.censusChanged }
+                    throw AppLaunchIdentityError.changedIdentity
+                }, nextObservation: {})
+            XCTFail("an identity change after a torn read must not be waitable")
+        } catch { XCTAssertEqual(error as? AppLaunchIdentityError, .changedIdentity) }
+        XCTAssertEqual(effects, 1); XCTAssertEqual(inventories, 2)
     }
 
     @MainActor

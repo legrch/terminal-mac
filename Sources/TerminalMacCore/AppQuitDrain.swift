@@ -5,6 +5,11 @@ import Foundation
 public enum AppQuitDrainProgress: Equatable {
     case originalExitsPending(root: AppProcessLife, primary: AppProcessLife)
     case inventoryPending(processes: Int, applications: Int)
+    /// After both original exits, the bounded torn-read sampler still saw the
+    /// process list change on every sample. This is NOT a survivor count and
+    /// NOT quiescence: nothing was observed, so the drain keeps waiting under
+    /// the caller's original deadline and never completes on this sample.
+    case inventoryUnobserved(tornSamples: Int)
     case quiescent
 }
 
@@ -169,6 +174,14 @@ public struct AppQuitDrain {
     ///
     /// A census exception is never caught as a retryable survivor. Yield only
     /// controls sample cadence; no number of yields establishes completion.
+    ///
+    /// After the original exits, the accepted tree is tearing down and its PIDs
+    /// churn. A torn read (`censusChanged`) is re-read with the same bounded
+    /// sampler used before Quit (`AppLaunchIdentity.stableCensus`); if every
+    /// sample is still torn, that observation is `.inventoryUnobserved` and the
+    /// loop waits for the next one. It is never counted as a survivor or as an
+    /// empty inventory. Every other census error, a changed original identity,
+    /// a new or reused accepted PID, and the original deadline still fail at once.
     @MainActor
     public func run(check: () throws -> Void,
                     terminatePrimary: () throws -> Bool,
@@ -176,6 +189,7 @@ public struct AppQuitDrain {
                     inventory: () throws -> AppProcessCensus,
                     nextObservation: () async throws -> Void,
                     observed: (AppQuitDrainProgress) -> Void = { _ in }) async throws {
+        var tornSamples = 0
         try Task.checkCancellation()
         try check()
         let initial = originals()
@@ -195,7 +209,20 @@ public struct AppQuitDrain {
             let census: AppProcessCensus?
             if exited {
                 try check()
-                census = try inventory()
+                do {
+                    census = try AppLaunchIdentity.stableCensus {
+                        try check()
+                        return try inventory()
+                    }
+                } catch AppLaunchIdentityError.censusChanged {
+                    // Unobserved, not a survivor: no state is inferred from it.
+                    tornSamples += 1
+                    observed(.inventoryUnobserved(tornSamples: tornSamples))
+                    try Task.checkCancellation()
+                    try check()
+                    try await nextObservation()
+                    continue
+                }
                 // Native metadata reads consume real time too. Expiry or
                 // cancellation during a complete empty sample is not success.
                 try Task.checkCancellation()
