@@ -169,6 +169,44 @@ final class AppQuitDrainTests: XCTestCase {
         }
     }
 
+    func testPerObservationAdmissionRejectsChangedOrNewAcceptedIdentity() throws {
+        let (_, _, _, drain) = try fixture()
+        XCTAssertNoThrow(try drain.requireAdmissible(helper))
+        XCTAssertNoThrow(try drain.requireAdmissible(process(900, path: "/usr/bin/unrelated", micros: 90)))
+        let reused = AppProcessSnapshot(key: AppProcessKey(pid: helper.key.pid, startSeconds: 101, startMicroseconds: 0),
+                                        parentPID: 1, uid: helper.uid, executable: helper.executable)
+        expect(.changedIdentity) { try drain.requireAdmissible(reused) }
+        expect(.unrelatedRoot) { try drain.requireAdmissible(process(400, path: helper.executable, micros: 60)) }
+        XCTAssertNoThrow(try drain.requireAdmissible(applications: [primaryApp]))
+        let renamed = AppGUIObservation(pid: 200, bundlePath: primaryApp.bundlePath, bundleID: "org.other",
+                                        executable: primaryApp.executable, regular: true)
+        expect(.metadataMismatch) { try drain.requireAdmissible(applications: [renamed]) }
+    }
+
+    @MainActor
+    func testTornSampleThatSawAChangedIdentityFailsInsteadOfBeingResampled() async throws {
+        // A sample observes a reused known PID, then becomes torn; the next sample
+        // would be empty. The observed violation must win over resampling.
+        let (_, _, _, drain) = try fixture()
+        let reused = AppProcessSnapshot(key: AppProcessKey(pid: helper.key.pid, startSeconds: 101, startMicroseconds: 0),
+                                        parentPID: 1, uid: helper.uid, executable: helper.executable)
+        var effects = 0, inventories = 0
+        do {
+            try await drain.run(check: {}, terminatePrimary: { effects += 1; return true },
+                originals: { effects == 0 ? (.running, .running) : (.exited, .exited) },
+                inventory: {
+                    inventories += 1
+                    if inventories == 1 {
+                        try drain.requireAdmissible(reused)        // what the native capture does first
+                        throw AppLaunchIdentityError.censusChanged
+                    }
+                    return self.census()
+                }, nextObservation: {})
+            XCTFail("an observed identity change must not be discarded by a torn resample")
+        } catch { XCTAssertEqual(error as? AppLaunchIdentityError, .changedIdentity) }
+        XCTAssertEqual(effects, 1); XCTAssertEqual(inventories, 1)
+    }
+
     func testNewAcceptedProcessCannotBeAdoptedAsAnotherQuittingHelper() throws {
         let (_, _, _, drain) = try fixture()
         let fresh = process(400, parent: 1, path: helper.executable, micros: 60)

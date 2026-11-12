@@ -44,11 +44,21 @@ enum GuestProcessCensus {
         try GuestGuard.requireVirtualMac()
         guard pid > 0 else { throw AppLaunchIdentityError.censusUnavailable }
         guard let before = try bsd(pid) else { return nil }
-        let executable = try path(pid)
-        guard let after = try bsd(pid), before.pbi_start_tvsec == after.pbi_start_tvsec,
+        // A process that exits between reads is absent, not changed. Only a
+        // live process whose identity differs between reads is censusChanged.
+        func pathOrAbsent() throws -> String? {
+            do { return try path(pid) } catch {
+                if (try bsd(pid)) == nil { return nil }
+                throw error
+            }
+        }
+        guard let executable = try pathOrAbsent() else { return nil }
+        guard let after = try bsd(pid) else { return nil }
+        guard let again = try pathOrAbsent() else { return nil }
+        guard before.pbi_start_tvsec == after.pbi_start_tvsec,
               before.pbi_start_tvusec == after.pbi_start_tvusec,
               before.pbi_uid == after.pbi_uid, before.pbi_ppid == after.pbi_ppid,
-              executable == (try path(pid)) else { throw AppLaunchIdentityError.censusChanged }
+              executable == again else { throw AppLaunchIdentityError.censusChanged }
         return AppProcessSnapshot(
             key: AppProcessKey(pid: pid, startSeconds: after.pbi_start_tvsec,
                                startMicroseconds: UInt32(after.pbi_start_tvusec)),
@@ -84,7 +94,12 @@ enum GuestProcessCensus {
     /// never downgraded to a positive survivor, omitted, or retried by the Quit
     /// drain loop. The caller's original deadline/cancellation/custody check
     /// runs throughout the bounded enumeration.
-    static func captureForQuit(check: () throws -> Void) throws -> AppProcessCensus {
+    /// `observe` / `observeApplications` validate each qualified observation
+    /// BEFORE a torn census may be discarded, so evidence of a changed or new
+    /// accepted identity in a sample that is later torn still fails at once.
+    static func captureForQuit(check: () throws -> Void,
+                               observe: (AppProcessSnapshot) throws -> Void = { _ in },
+                               observeApplications: ([AppGUIObservation]) throws -> Void = { _ in }) throws -> AppProcessCensus {
         try GuestGuard.requireVirtualMac()
         try Task.checkCancellation()
         try check()
@@ -96,6 +111,7 @@ enum GuestProcessCensus {
             guard let process = try GuestProcessCensus.process(pid), process.uid == geteuid() else {
                 throw AppLaunchIdentityError.censusChanged
             }
+            try observe(process)
             processes.append(process)
         }
         // Do not filter by PID membership, isTerminated or activationPolicy:
@@ -110,6 +126,7 @@ enum GuestProcessCensus {
                               bundleID: $0.bundleIdentifier ?? "", executable: $0.executableURL?.path ?? "",
                               regular: $0.activationPolicy == .regular)
         }
+        try observeApplications(applications)
         guard before == (try pids()) else { throw AppLaunchIdentityError.censusChanged }
         try Task.checkCancellation()
         try check()
@@ -205,6 +222,9 @@ final class GuestOriginalProcessObserver {
             // observed without repeating any process operation.
             if let actual, !actual.sameProcess(as: expected) { invalid = true }
             return life
+        } catch AppLaunchIdentityError.censusChanged {
+            // A live identity transition was observed: poison, never wait it out.
+            invalid = true; return .unknown
         } catch { return .exitPending }
     }
 }
@@ -355,7 +375,9 @@ final class GuestApplicationLifecycle {
         }, inventory: {
             self.quitInventoryReadAttempts += 1
             self.quitStep = "drain-inventory"
-            return try GuestProcessCensus.captureForQuit(check: check)
+            return try GuestProcessCensus.captureForQuit(check: check,
+                observe: { try drain.requireAdmissible($0) },
+                observeApplications: { try drain.requireAdmissible(applications: $0) })
         }, nextObservation: {
             // Scheduling cadence ONLY. Each new sample rechecks the original
             // request deadline/cancellation; elapsed time never proves exit.

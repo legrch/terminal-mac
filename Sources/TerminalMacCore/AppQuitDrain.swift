@@ -160,6 +160,33 @@ public struct AppQuitDrain {
             .inventoryPending(processes: survivors, applications: applications)
     }
 
+    /// Per-observation checks for a census still being read. A changed known
+    /// identity or an unknown accepted process fails even if that sample is
+    /// later torn and discarded; unrelated processes and exits are admissible.
+    public func requireAdmissible(_ process: AppProcessSnapshot) throws {
+        if let expected = known[process.key.pid], !expected.sameProcess(as: process) {
+            throw AppLaunchIdentityError.changedIdentity
+        }
+        if plan.contains(process.executable) {
+            guard let expected = known[process.key.pid], expected.sameProcess(as: process) else {
+                throw AppLaunchIdentityError.unrelatedRoot
+            }
+        }
+    }
+
+    public func requireAdmissible(applications: [AppGUIObservation]) throws {
+        for app in applications {
+            let relevant = known[app.pid] != nil || plan.contains(app.executable) ||
+                plan.containsBundle(app.bundlePath)
+            guard relevant else { continue }
+            guard let expected = registered[app.pid],
+                  app.bundlePath == expected.bundlePath, app.bundleID == expected.bundleID,
+                  app.executable == expected.executable else {
+                throw AppLaunchIdentityError.metadataMismatch
+            }
+        }
+    }
+
     /// Close uses a NEW complete observation, not the previous Quit result.
     /// It never waits, signals or repairs a failed/unknown operation.
     public func requireQuiescent(root: AppProcessLife, primary: AppProcessLife,
