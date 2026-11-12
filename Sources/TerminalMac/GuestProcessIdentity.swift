@@ -73,25 +73,27 @@ enum GuestProcessCensus {
         try sampling.requireGuest()
         guard pid > 0 else { throw AppLaunchIdentityError.censusUnavailable }
         guard let before = try sampling.bsd(pid) else { return nil }
-        // A process that exits between reads is absent, not changed. Only a
-        // live process whose identity differs between reads is changedIdentity.
+        // Parent PID is ancestry, not identity: reparenting is permitted.
+        func requireSameIdentity(_ after: proc_bsdinfo) throws {
+            guard before.pbi_pid == UInt32(pid), after.pbi_pid == UInt32(pid),
+                  before.pbi_start_tvsec == after.pbi_start_tvsec,
+                  before.pbi_start_tvusec == after.pbi_start_tvusec,
+                  before.pbi_uid == after.pbi_uid else { throw AppLaunchIdentityError.changedIdentity }
+        }
+        // Absence is not an identity transition, but it must never erase an
+        // immutable identity mismatch already observed in successful reads.
         func pathOrAbsent() throws -> String? {
             do { return try sampling.path(pid) } catch {
-                if (try sampling.bsd(pid)) == nil { return nil }
+                guard let current = try sampling.bsd(pid) else { return nil }
+                try requireSameIdentity(current)
                 throw error
             }
         }
         guard let executable = try pathOrAbsent() else { return nil }
         guard let after = try sampling.bsd(pid) else { return nil }
+        try requireSameIdentity(after)
         guard let again = try pathOrAbsent() else { return nil }
-        // Parent PID is ancestry, not identity (AppLaunchIdentity excludes it):
-        // a parent exiting mid-read reparents the child and must not poison it.
-        // The latest parent is reported; start, UID and executable must hold.
-        guard before.pbi_pid == UInt32(pid), after.pbi_pid == UInt32(pid),
-              before.pbi_start_tvsec == after.pbi_start_tvsec,
-              before.pbi_start_tvusec == after.pbi_start_tvusec,
-              before.pbi_uid == after.pbi_uid,
-              executable == again else { throw AppLaunchIdentityError.changedIdentity }
+        guard executable == again else { throw AppLaunchIdentityError.changedIdentity }
         return AppProcessSnapshot(
             key: AppProcessKey(pid: pid, startSeconds: after.pbi_start_tvsec,
                                startMicroseconds: UInt32(after.pbi_start_tvusec)),

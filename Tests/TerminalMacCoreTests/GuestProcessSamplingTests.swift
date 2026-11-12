@@ -17,13 +17,15 @@ final class GuestProcessSamplingTests: XCTestCase {
         AppProcessSnapshot(key: AppProcessKey(pid: 42, startSeconds: 100, startMicroseconds: 20),
                            parentPID: 10, uid: 501, executable: "/Applications/Fixture.app/Contents/MacOS/Fixture")
     }
-    private func sampling(reads: [proc_bsdinfo?], paths: [String]? = nil) -> GuestProcessCensus.Sampling {
+    private func sampling(reads: [proc_bsdinfo?], paths: [String]? = nil,
+                          pathFailureAt: Int? = nil) -> GuestProcessCensus.Sampling {
         var index = 0, pathIndex = 0
         let paths = paths ?? [expected.executable, expected.executable]
         return GuestProcessCensus.Sampling(requireGuest: {}, bsd: { _ in
             guard index < reads.count else { XCTFail("Unexpected native read"); throw AppLaunchIdentityError.censusUnavailable }
             defer { index += 1 }; return reads[index]
         }, path: { _ in
+            if pathIndex == pathFailureAt { throw AppLaunchIdentityError.censusUnavailable }
             guard pathIndex < paths.count else { XCTFail("Unexpected path read"); throw AppLaunchIdentityError.censusUnavailable }
             defer { pathIndex += 1 }; return paths[pathIndex]
         }, pids: { [42] }, applications: { [] }, uid: 501)
@@ -96,6 +98,52 @@ final class GuestProcessSamplingTests: XCTestCase {
         }) { XCTAssertEqual($0 as? AppLaunchIdentityError, .changedIdentity) }
         XCTAssertEqual(observedUID, 502)
         XCTAssertEqual(attempts, 1)
+    }
+
+    func testBSDTransitionBeforePathFailureCannotBeResampledAway() {
+        var changedPID = bsd(); changedPID.pbi_pid = 43
+        for changed in [bsd(uid: 502), bsd(seconds: 101), bsd(micros: 21), changedPID] {
+            var attempts = 0
+            XCTAssertThrowsError(try AppLaunchIdentity.stableCensus {
+                attempts += 1
+                let source = attempts == 1 ?
+                    self.sampling(reads: [self.bsd(), changed, nil], pathFailureAt: 1) :
+                    self.sampling(reads: [self.bsd(), self.bsd()])
+                return try GuestProcessCensus.captureForQuit(check: {}, sampling: source)
+            }) { XCTAssertEqual($0 as? AppLaunchIdentityError, .changedIdentity) }
+            XCTAssertEqual(attempts, 1)
+        }
+    }
+
+    func testBSDTransitionBeforePathFailurePoisonsLaterOriginalExit() {
+        var changedPID = bsd(); changedPID.pbi_pid = 43
+        for changed in [bsd(uid: 502), bsd(seconds: 101), bsd(micros: 21), changedPID] {
+            let source = sampling(reads: [bsd(), changed, nil], pathFailureAt: 1)
+            var didExit = false
+            let observer = GuestOriginalProcessObserver(expected, sample: {
+                try GuestProcessCensus.process(42, sampling: source)
+            }, originalExit: { didExit })
+            XCTAssertEqual(observer.life(), .unknown)
+            didExit = true
+            XCTAssertEqual(observer.life(), .unknown)
+        }
+    }
+
+    func testPathFailureProbePreservesObservedBSDTransition() {
+        for changed in [bsd(uid: 502), bsd(seconds: 101), bsd(micros: 21)] {
+            let source = sampling(reads: [bsd(), changed], pathFailureAt: 0)
+            XCTAssertThrowsError(try GuestProcessCensus.process(42, sampling: source)) {
+                XCTAssertEqual($0 as? AppLaunchIdentityError, .changedIdentity)
+            }
+            let observerSource = sampling(reads: [bsd(), changed], pathFailureAt: 0)
+            var didExit = false
+            let observer = GuestOriginalProcessObserver(expected, sample: {
+                try GuestProcessCensus.process(42, sampling: observerSource)
+            }, originalExit: { didExit })
+            XCTAssertEqual(observer.life(), .unknown)
+            didExit = true
+            XCTAssertEqual(observer.life(), .unknown)
+        }
     }
     func testQuitPIDListChurnCanStillResampleACompleteRead() throws {
         var source = sampling(reads: [bsd(), bsd(), bsd(), bsd()],
