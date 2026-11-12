@@ -132,8 +132,21 @@ final class AppServiceMCPSession {
         // Durable intent precedes the SINGLE mailbox request. Failure to
         // publish the intent is UNKNOWN, not permission to send/retry it.
         try publish(intent, "intent-\(intent.sequence)-\(command).json")
-        let reply = try await guest(Request(action: "app-service", arguments: intent.arguments,
+        let reply: Reply
+        do {
+            reply = try await guest(Request(action: "app-service", arguments: intent.arguments,
                                             timeout: command == "quit" ? 90 : 80))
+        } catch let failure as OutcomeFailure {
+            // Record which guest step failed. Diagnostics only: the outcome
+            // stays UNKNOWN and nothing is retried or reconciled from them.
+            let diagnostics = AppServiceContract.failureDiagnostics(failure.values)
+            if !diagnostics.isEmpty {
+                try? publish(diagnostics.merging(["reason": failure.message, "command": command,
+                                                  "sequence": String(intent.sequence)]) { current, _ in current },
+                             "failure-\(intent.sequence)-\(command).json")
+            }
+            throw failure
+        }
         let receipt = try current.accept(reply.values, intent: intent)
         session = current
         try publish(receipt, "receipt-\(intent.sequence)-\(command).json")

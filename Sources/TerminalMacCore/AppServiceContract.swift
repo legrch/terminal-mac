@@ -24,6 +24,20 @@ public enum AppServiceContract {
         "APP_SERVICE_INSTALLED_COLLISION",
         "APP_SERVICE_LAUNCH_UNKNOWN", "APP_SERVICE_QUIT_UNKNOWN", "APP_SERVICE_PUBLICATION_UNKNOWN"
     ]
+    /// Keys a failed quit/close may report so the failing step is identifiable.
+    /// Values are short labels/counters only: no paths, PIDs or identities.
+    public static let failureDiagnosticKeys: Set<String> = [
+        "quitStep", "launchIdentityState", "launchIdentityReason", "normalQuitRequested",
+        "quitDrainState", "quitLastObservation", "quitResidualProcesses",
+        "quitResidualApplications", "quitInventoryReadAttempts", "quitTornSamples"
+    ]
+    public static func failureDiagnostics(_ values: [String: String]) -> [String: String] {
+        values.filter { key, value in
+            failureDiagnosticKeys.contains(key) && !value.isEmpty && value.utf8.count <= 64 &&
+                value.utf8.allSatisfy { (48...57).contains($0) || (65...90).contains($0) ||
+                    (97...122).contains($0) || [45, 46, 95].contains($0) }
+        }
+    }
     public static func refuse(_ reason: String) -> OutcomeFailure {
         OutcomeFailure(reasons.contains(reason) ? reason : "APP_SERVICE_INVALID", outcome: .noEffect)
     }

@@ -396,7 +396,15 @@ final class GuestAppService {
                 record?.markUnknown()
                 let identityReason = command.command == "quit" || command.command == "close" ? "APP_SERVICE_QUIT_UNKNOWN" : "APP_SERVICE_LAUNCH_UNKNOWN"
                 let reason = (error as? OutcomeFailure)?.message ?? (error is AppLaunchIdentityError ? identityReason : "APP_SERVICE_IO")
-                throw OutcomeFailure(AppServiceContract.reasons.contains(reason) ? reason : "APP_SERVICE_IO", outcome: .mutationUnknown)
+                var diagnostics: [String: String] = [:]
+                if ["quit", "close"].contains(command.command), let lifecycle {
+                    // One create-only retention of the failed step for later
+                    // read-only observation; a failed write is not replayed.
+                    try? retainLaunchEvidence("lifecycle", command: command)
+                    diagnostics = AppServiceContract.failureDiagnostics(lifecycle.diagnosticValues())
+                }
+                throw OutcomeFailure(AppServiceContract.reasons.contains(reason) ? reason : "APP_SERVICE_IO",
+                                     outcome: .mutationUnknown, values: diagnostics)
             }
             let reason = (error as? OutcomeFailure)?.message ??
                 ((error as? AppLaunchIdentityError) == .preexisting ? "APP_SERVICE_RUNNING" :

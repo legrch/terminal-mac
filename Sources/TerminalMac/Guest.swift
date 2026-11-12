@@ -287,7 +287,8 @@ final class GuestRuntime: NSObject {
             try mailbox.respond(Reply(id: request.id, values: values))
         } catch {
             let outcome = effects.outcome(for: error)
-            try? mailbox.respond(Reply(id: request.id, error: error.localizedDescription, outcome: outcome))
+            try? mailbox.respond(Reply(id: request.id, values: (error as? OutcomeFailure)?.values ?? [:],
+                                       error: error.localizedDescription, outcome: outcome))
         }
     }
     func requireAccessibility() throws {

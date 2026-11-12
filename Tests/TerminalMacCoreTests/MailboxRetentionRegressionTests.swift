@@ -69,6 +69,33 @@ final class MailboxRetentionRegressionTests: XCTestCase {
         XCTAssertNil(try client.read("reply-\(request.id.uuidString).json"))
     }
 
+    func testFailureReplyCarriesOnlyFilteredQuitDiagnostics() async throws {
+        let (client, server, _) = try mailboxPair()
+        let request = Request(action: "app-service", timeout: 2)
+        let caller = Task { try await client.call(request) }
+        let received = try await collect(server)
+        let raw = ["quitStep": "drain-inventory", "normalQuitRequested": "true",
+                   "quitDrainState": "accepted-inventory-unobserved", "quitTornSamples": "3",
+                   "launchIdentityReason": "PROCESS_CENSUS_CHANGED",
+                   "uiPrimaryExecutable": "/Applications/Example.app/Contents/MacOS/Example",
+                   "launchAncestry": "1:2>3:4"]
+        try server.respond(Reply(id: received.id,
+                                 values: AppServiceContract.failureDiagnostics(raw),
+                                 error: "APP_SERVICE_QUIT_UNKNOWN", outcome: .mutationUnknown))
+        do {
+            _ = try await caller.value
+            XCTFail("a failure reply must throw")
+        } catch let failure as OutcomeFailure {
+            XCTAssertEqual(failure.message, "APP_SERVICE_QUIT_UNKNOWN")
+            XCTAssertEqual(failure.outcome, .mutationUnknown)
+            XCTAssertEqual(failure.values["quitStep"], "drain-inventory")
+            XCTAssertEqual(failure.values["normalQuitRequested"], "true")
+            XCTAssertEqual(failure.values["quitTornSamples"], "3")
+            XCTAssertNil(failure.values["uiPrimaryExecutable"])   // paths never cross
+            XCTAssertNil(failure.values["launchAncestry"])        // nor identities
+        }
+    }
+
     func testRespondRefusesWhenNoCallerOwnsTheSlot() throws {
         let (server, _, _) = try mailboxPair()
         // Without a caller-created slot there is no owner: publication must fail closed instead

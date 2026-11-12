@@ -241,7 +241,10 @@ public final class Mailbox {
             // complete reply instead of failing on a partial payload.
             if let data = try read(replyName), let reply = try? JSONDecoder().decode(Reply.self, from: data) {
                 guard reply.id == request.id else { throw Failure("Mismatched reply") }
-                if !reply.ok { throw OutcomeFailure(reply.error ?? "Action failed", outcome: reply.outcome ?? .mutationUnknown) }
+                if !reply.ok {
+                    throw OutcomeFailure(reply.error ?? "Action failed", outcome: reply.outcome ?? .mutationUnknown,
+                                         values: reply.values)
+                }
                 return reply
             }
             try await Task.sleep(nanoseconds: interval)

@@ -22,7 +22,11 @@ public enum GuestOutcome: String, Codable, Sendable {
 public struct OutcomeFailure: LocalizedError {
     public let message: String
     public let outcome: GuestOutcome
-    public init(_ message: String, outcome: GuestOutcome) { self.message = message; self.outcome = outcome }
+    /// Content-free diagnostics for a failure (never authority, never replayed).
+    public let values: [String: String]
+    public init(_ message: String, outcome: GuestOutcome, values: [String: String] = [:]) {
+        self.message = message; self.outcome = outcome; self.values = values
+    }
     public var errorDescription: String? { message }
 }
 
