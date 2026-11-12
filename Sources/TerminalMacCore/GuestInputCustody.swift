@@ -161,7 +161,9 @@ public final class GuestInputCustody {
 
     private func finishConfirmed() throws {
         do {
-            try InputLease.withAdmission(directory: location) {
+            // The effect is confirmed: serialize cleanup with short admission
+            // sections instead of stranding its records on ordinary contention.
+            try InputLease.withAdmission(directory: location, wait: true) {
                 func removeFence() throws {
                     try requireOriginalFence()
                     guard unlinkat(directory, InputLease.operationName, 0) == 0, fsync(directory) == 0 else {

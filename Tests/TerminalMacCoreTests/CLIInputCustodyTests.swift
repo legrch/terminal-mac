@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import XCTest
 @testable import TerminalMacCore
 @testable import TerminalMac
@@ -133,6 +134,50 @@ final class CLIInputCustodyTests: XCTestCase {
         XCTAssertEqual(try InputLease.probe(directory: directory), .free)
         let next = try InputLease.acquire(directory: directory, owner: "next", generation: 2)
         next.release()
+    }
+
+    func testConfirmedCompletionWaitsForAdmissionWithoutReplayingEffect() async throws {
+        for borrowed in [false, true] {
+            let (_, directory, box) = try fixture()
+            let holder = borrowed ? try InputLease.acquire(directory: directory, owner: "scenario", generation: 1) : nil
+            if let holder { try box.publishLeaseFlag(owner: holder.owner, ttl: 120) }
+            let operation = try GuestInputCustody.begin(directory: directory, mailbox: box,
+                request: Request(action: "key"), claimedOwner: holder?.owner)
+            if let holder {
+                XCTAssertThrowsError(try box.releaseLeaseFlag(ownedBy: holder.owner))
+                holder.release(preserveMetadata: true)
+            }
+            let admission = open(directory.appendingPathComponent("input-admission.lock").path, O_RDWR | O_CLOEXEC)
+            XCTAssertGreaterThanOrEqual(admission, 0)
+            defer { _ = flock(admission, LOCK_UN); close(admission) }
+            XCTAssertEqual(flock(admission, LOCK_EX | LOCK_NB), 0)
+            let confirmed = DispatchSemaphore(value: 0), finished = DispatchSemaphore(value: 0)
+            let completion = Task.detached {
+                defer { finished.signal() }
+                return try await operation.perform {
+                    confirmed.signal()
+                    return "confirmed once"
+                }
+            }
+            XCTAssertEqual(confirmed.wait(timeout: .now() + 5), .success)
+            // Dispatch still refuses while the completion is waiting for teardown.
+            XCTAssertThrowsError(try GuestInputCustody.begin(directory: directory, mailbox: box,
+                request: Request(action: "key")))
+            XCTAssertEqual(finished.wait(timeout: .now() + 0.1), .timedOut)
+            XCTAssertTrue(try InputLease.hasOperationFence(directory))
+            XCTAssertEqual(flock(admission, LOCK_UN), 0)
+            let result = try await completion.value
+            XCTAssertEqual(result, "confirmed once")
+            XCTAssertFalse(try InputLease.hasOperationFence(directory))
+            XCTAssertEqual(box.helperUpdateDisposition(), .unmarked)
+            XCTAssertEqual(try InputLease.probe(directory: directory), .free)
+            let next = try InputLease.acquire(directory: directory, owner: "next", generation: 2)
+            next.release()
+            do {
+                try await operation.perform { XCTFail("A confirmed effect must never be replayed") }
+                XCTFail("Completed custody cannot be performed again")
+            } catch {}
+        }
     }
     func testConfirmedBorrowerHandsClosingCustodyBackToStillLiveHolder() async throws {
         let (_, directory, box) = try fixture()
