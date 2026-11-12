@@ -229,4 +229,25 @@ final class GuestProcessSamplingTests: XCTestCase {
         didExit = true
         XCTAssertEqual(observer.life(), .unknown)   // poisoned for good, never exited
     }
+
+    func testExecToAnotherExecutableThatThenVanishesIsStillReported() throws {
+        // Same key and UID; the first path read shows another executable; the
+        // second path read fails and the process is gone by the probe.
+        var bsdReads = 0, pathReads = 0
+        let info = bsd()
+        let sampling = GuestProcessCensus.Sampling(requireGuest: {}, bsd: { _ in
+            defer { bsdReads += 1 }; return bsdReads < 2 ? info : nil
+        }, path: { _ in
+            defer { pathReads += 1 }
+            if pathReads == 0 { return "/usr/bin/unrelated" }
+            throw AppLaunchIdentityError.censusUnavailable
+        }, pids: { [42] }, applications: { [] }, uid: 501)
+        let original = expected
+        XCTAssertThrowsError(try GuestProcessCensus.stableCaptureForQuit(check: {}, observe: { snapshot in
+            if snapshot.key.pid == original.key.pid, !snapshot.sameProcess(as: original) {
+                throw AppLaunchIdentityError.changedIdentity
+            }
+        }, sampling: sampling)) { XCTAssertEqual($0 as? AppLaunchIdentityError, .changedIdentity) }
+        XCTAssertEqual(pathReads, 1)
+    }
 }

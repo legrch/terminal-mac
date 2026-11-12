@@ -72,7 +72,8 @@ enum GuestProcessCensus {
     /// UID) before any further fallible read, so a forbidden identity that then
     /// vanishes is still reported instead of becoming absence.
     static func process(_ pid: Int32, sampling injected: Sampling? = nil,
-                        observeKey: (AppProcessKey, UInt32) throws -> Void = { _, _ in }) throws -> AppProcessSnapshot? {
+                        observeKey: (AppProcessKey, UInt32) throws -> Void = { _, _ in },
+                        observePartial: (AppProcessSnapshot) throws -> Void = { _ in }) throws -> AppProcessSnapshot? {
         let sampling = injected ?? nativeSampling
         try sampling.requireGuest()
         guard pid > 0 else { throw AppLaunchIdentityError.censusUnavailable }
@@ -99,11 +100,19 @@ enum GuestProcessCensus {
                 throw error
             }
         }
+        func partial(_ info: proc_bsdinfo, _ executable: String) -> AppProcessSnapshot {
+            AppProcessSnapshot(key: key(info), parentPID: Int32(truncatingIfNeeded: info.pbi_ppid),
+                               uid: info.pbi_uid, executable: executable)
+        }
         guard let executable = try pathOrAbsent() else { return nil }
+        // Each (kernel key, executable) pair is checked as soon as it is read,
+        // so an exec to another executable cannot vanish into absence later.
+        try observePartial(partial(before, executable))
         guard let after = try sampling.bsd(pid) else { return nil }
         try observeKey(key(after), after.pbi_uid)
         try requireSameIdentity(after)
         guard let again = try pathOrAbsent() else { return nil }
+        try observePartial(partial(after, again))
         guard executable == again else { throw AppLaunchIdentityError.changedIdentity }
         return AppProcessSnapshot(
             key: AppProcessKey(pid: pid, startSeconds: after.pbi_start_tvsec,
@@ -172,7 +181,8 @@ enum GuestProcessCensus {
         for pid in before {
             try Task.checkCancellation()
             try check()
-            guard let process = try GuestProcessCensus.process(pid, sampling: sampling, observeKey: observeKey) else {
+            guard let process = try GuestProcessCensus.process(pid, sampling: sampling, observeKey: observeKey,
+                                                               observePartial: observe) else {
                 throw AppLaunchIdentityError.censusChanged
             }
             try observe(process)
@@ -260,6 +270,8 @@ final class GuestOriginalProcessObserver {
         sample = {
             try GuestProcessCensus.process(process.key.pid, observeKey: { key, uid in
                 guard key == process.key, uid == process.uid else { throw AppLaunchIdentityError.changedIdentity }
+            }, observePartial: { partial in
+                guard partial.sameProcess(as: process) else { throw AppLaunchIdentityError.changedIdentity }
             })
         }
         originalExit = { try Self.pollExit(queue: acquired, pid: process.key.pid) }
