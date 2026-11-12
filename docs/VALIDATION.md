@@ -191,3 +191,24 @@ Terminal, normal `open -n '/Volumes/My Shared Files/tools/TerminalMacGuest.app'`
 started the normal installer. Its guest service/lease guards still applied.
 Re-add only the installed guest app through normal macOS permission UI when
 ad-hoc signing changes; never reset TCC databases or change host security.
+
+### Post-terminate drain torn reads (November 12, 2026)
+
+Helper16 in fresh `farol-qa-59903180cc7c4a62` reached READY and rendered the
+Dev app, then the clean-EOF Quit returned `APP_SERVICE_QUIT_UNKNOWN` about 1.5 s
+later with no Quit receipt. The guest did not publish its failing step, so the
+cause is not proven; the likeliest is a strict single-read census raising
+`PROCESS_CENSUS_CHANGED` while Electron helpers exited after terminate. That
+original UNKNOWN, its disk and its lease fence remain retained.
+
+After both original exits the drain now re-reads a torn census with the same
+eight-attempt sampler (original custody/deadline checked in every attempt). A
+sample that is torn on every attempt is `inventoryUnobserved`: neither a
+survivor nor quiescence, and the loop waits for the next observation under the
+original deadline only. Unreadable or incomplete inventories, changed original
+identity, new or reused accepted PIDs and deadline expiry still fail at once.
+Terminate is still requested at most once. A failed Quit/Close now returns its
+step (`quitStep`), reason, `normalQuitRequested`, drain state and counters (no
+paths or identities) in the failure reply; the MCP host publishes them as
+`failure-<sequence>-<command>.json` beside the intent. The outcome stays
+UNKNOWN. All 222 XCTest cases pass; helper live qualification remains pending.
