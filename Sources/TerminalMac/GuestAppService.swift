@@ -95,6 +95,14 @@ final class GuestAppService {
 
     /// Immutable bounded metadata, separate from state.json and the original
     /// action receipt. No argv, environment, application text or credentials.
+    /// Set before entering the writer: a throw may follow a partial write,
+    /// rename or sync. The error path cannot repeat this same publication.
+    static func publishLifecycleEvidence(attempted: inout Bool, writer: () throws -> Void) throws {
+        guard !attempted else { return }
+        attempted = true
+        try writer()
+    }
+
     private func retainLaunchEvidence(_ phase: String, command: AppServiceCommand) throws {
         guard ["returned", "resolution", "lifecycle"].contains(phase), let runDirectory,
               let lifecycle, let record else { throw AppServiceContract.refuse("APP_SERVICE_UNRESOLVED") }
@@ -225,6 +233,7 @@ final class GuestAppService {
         try check(request, owner: command.owner)
         var effectStarted = false
         var launchResolutionAttempted = false
+        var lifecycleEvidenceAttempted = false
         do {
             if command.command == "open" {
                 guard record == nil || record?.phase == "closed" else { throw AppServiceContract.refuse("APP_SERVICE_BUSY") }
@@ -356,12 +365,16 @@ final class GuestAppService {
             case "quit":
                 guard let lifecycle else { throw AppServiceContract.refuse("APP_SERVICE_QUIT_UNKNOWN") }
                 try await lifecycle.quit { try self.check(request, owner: command.owner) }
-                try retainLaunchEvidence("lifecycle", command: command)
+                try Self.publishLifecycleEvidence(attempted: &lifecycleEvidenceAttempted) {
+                    try retainLaunchEvidence("lifecycle", command: command)
+                }
                 try next.complete("quit")
             case "close":
                 if let lifecycle {
                     try lifecycle.requireExited { try self.check(request, owner: command.owner) }
-                    try retainLaunchEvidence("lifecycle", command: command)
+                    try Self.publishLifecycleEvidence(attempted: &lifecycleEvidenceAttempted) {
+                        try retainLaunchEvidence("lifecycle", command: command)
+                    }
                 }
                 // Verify the installed application tree again after Quit.
                 // Closure retains /Applications and private receipts; it never
@@ -400,7 +413,9 @@ final class GuestAppService {
                 if ["quit", "close"].contains(command.command), let lifecycle {
                     // One create-only retention of the failed step for later
                     // read-only observation; a failed write is not replayed.
-                    try? retainLaunchEvidence("lifecycle", command: command)
+                    try? Self.publishLifecycleEvidence(attempted: &lifecycleEvidenceAttempted) {
+                        try retainLaunchEvidence("lifecycle", command: command)
+                    }
                     diagnostics = AppServiceContract.failureDiagnostics(lifecycle.diagnosticValues())
                 }
                 throw OutcomeFailure(AppServiceContract.reasons.contains(reason) ? reason : "APP_SERVICE_IO",

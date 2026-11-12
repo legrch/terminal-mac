@@ -138,6 +138,10 @@ public final class AppServiceDirectory {
     /// Durable publication; failures preserve the partial/private evidence.
     /// The caller freezes its service on any uncertain publication result.
     public func write(_ data: Data, named value: String, createOnly: Bool = false) throws {
+        try write(data, named: value, createOnly: createOnly, beforeRename: {}, afterRename: {})
+    }
+    func write(_ data: Data, named value: String, createOnly: Bool,
+               beforeRename: () throws -> Void, afterRename: () throws -> Void) throws {
         try name(value)
         guard data.count <= 4 * 1024 * 1024 else { throw AppServiceContract.refuse("APP_SERVICE_INVALID") }
         let temporary = "pending-" + UUID().uuidString.lowercased() + ".json"
@@ -146,8 +150,11 @@ public final class AppServiceDirectory {
         defer { close(output) }
         try Self.writeAll(output, data)
         guard fsync(output) == 0 else { throw AppServiceContract.refuse("APP_SERVICE_PUBLICATION_UNKNOWN") }
+        try beforeRename()
         let result = createOnly ? renameatx_np(fd, temporary, fd, value, UInt32(RENAME_EXCL)) : renameat(fd, temporary, fd, value)
-        guard result == 0, fsync(fd) == 0 else { throw AppServiceContract.refuse("APP_SERVICE_PUBLICATION_UNKNOWN") }
+        guard result == 0 else { throw AppServiceContract.refuse("APP_SERVICE_PUBLICATION_UNKNOWN") }
+        try afterRename()
+        guard fsync(fd) == 0 else { throw AppServiceContract.refuse("APP_SERVICE_PUBLICATION_UNKNOWN") }
     }
     private static func writeAll(_ output: Int32, _ data: Data) throws {
         try data.withUnsafeBytes { bytes in
