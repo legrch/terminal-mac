@@ -212,3 +212,23 @@ step (`quitStep`), reason, `normalQuitRequested`, drain state and counters (no
 paths or identities) in the failure reply; the MCP host publishes them as
 `failure-<sequence>-<command>.json` beside the intent. The outcome stays
 UNKNOWN. All 222 XCTest cases pass; helper live qualification remains pending.
+
+### Original exit race and guest shutdown confirmation (November 12, 2026)
+
+Helper17 published its failing step on the next live run (`farol-qa-f9930e4f158049f9`):
+`quitStep=drain-originals`, `normalQuitRequested=true`, no inventory read,
+`ORIGINAL_PROCESS_OBSERVATION_UNAVAILABLE`. The earlier torn-read hypothesis was
+therefore not the cause. The exit observer saw the original process absent before
+its registered NOTE_EXIT was dequeued and classified that as unknown. Absence or
+unreadability is now `exitPending`: never proof of exit, it keeps the drain waiting
+for the kernel event under the original deadline. A changed identity or a mismatched
+kernel event stays unknown; quit admission and close requirements are unchanged.
+
+`stop` presses the virtual power button, and macOS answers with its own
+"shut down your computer now?" dialog, which waited indefinitely in every
+long `stopping` seen that day. After 60 seconds the runtime now reports
+`stopping-awaiting-guest-confirmation`. Nothing confirms it by default. The opt-in
+`stop --confirm-guest-dialog` presses only loginwindow's `Shut Down` button, once,
+and only while a stop is pending, guest input is neither held nor fenced and the
+live helper has Accessibility; it never forces. All 228 XCTest cases pass; live
+qualification of both changes remains pending.
