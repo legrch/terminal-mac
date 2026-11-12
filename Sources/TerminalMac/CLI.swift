@@ -95,7 +95,7 @@ final class CLI {
             // Keep the app event loop and runtime alive until guest shutdown.
             while true { try await Task.sleep(nanoseconds: 1_000_000_000) }
         case "status", "show", "hide", "pause", "resume", "stop":
-            let args = try Arguments(tail, flags: command == "stop" ? ["force"] : [], options: ["owner"])
+            let args = try Arguments(tail, flags: command == "stop" ? ["force", "confirm-guest-dialog"] : [], options: ["owner"])
             let name = try args.machineName()
             _ = try store.load(name)
             if command == "status", !(try runtimeIsLocked(store.directory(name))) {
@@ -104,6 +104,11 @@ final class CLI {
             var lifecycle = ["force": String(args.flags.contains("force"))]
             // The lease holder that deliberately shows the login window stays interactive in it.
             if let owner = args.options["owner"] { lifecycle["leaseOwner"] = owner }
+            if command == "stop", args.flags.contains("confirm-guest-dialog") {
+                guard !args.flags.contains("force") else { throw Failure("Use either --force or --confirm-guest-dialog") }
+                try printJSON(try await stopConfirmingGuestDialog(name))
+                return
+            }
             let reply = try await host(name, action: command, arguments: lifecycle)
             try printJSON(reply.values)
         case "lease":
@@ -336,6 +341,41 @@ final class CLI {
         }
         return executableURL.path
     }
+    /// Opt-in: request a normal guest shutdown, then press only the system's own
+    /// confirmation button once if the guest is still waiting. Never forces,
+    /// never retries the press, and refuses while guest input is held or fenced.
+    func stopConfirmingGuestDialog(_ name: String) async throws -> [String: String] {
+        let directory = try store.directory(name)
+        func state() async throws -> String {
+            guard try runtimeIsLocked(directory) else { return "stopped" }
+            return try await host(name, action: "status").values["state"] ?? "unknown"
+        }
+        func waitStopped(seconds: Int) async throws -> String {
+            for _ in 0..<seconds {
+                let current = try await state()
+                if current == "stopped" { return current }
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            return try await state()
+        }
+        var current = try await state()
+        guard current != "stopped" else { return ["state": "stopped", "guestDialogConfirmed": "false"] }
+        if current == "running" {
+            _ = try await host(name, action: "stop", arguments: ["force": "false"])
+        }
+        current = try await waitStopped(seconds: 10)
+        guard current != "stopped" else { return ["state": "stopped", "guestDialogConfirmed": "false"] }
+        let lease = InputLease.admission(probe: try InputLease.probe(directory: directory), claimedOwner: nil)
+        let mailbox = try Mailbox(directory.appendingPathComponent("exchange"))
+        let helper = try? await mailbox.call(Request(action: "status", timeout: 10))
+        guard GuestStopConfirmation.admissible(runtimeState: current, lease: lease,
+                                               helperAccessibility: helper?.values["accessibility"]) else {
+            throw Failure("Guest shutdown confirmation is not admissible (state \(current)); the stop request remains pending")
+        }
+        let pressed = try await mailbox.call(Request(action: GuestStopConfirmation.guestAction, timeout: 15))
+        let final = try await waitStopped(seconds: 60)
+        return ["state": final, "guestDialogConfirmed": pressed.values["pressed"] ?? "false"]
+    }
     func runtimeIsLocked(_ directory: URL) throws -> Bool { try Self.isRunning(directory) }
     static func isRunning(_ directory: URL) throws -> Bool {
         try RuntimeLock.isHeld(in: directory)
@@ -361,6 +401,7 @@ final class CLI {
     show|hide [NAME]             Show or hide the native VM window
     status|pause|resume [NAME]   Manage the VM
     stop [NAME] [--force]        Request guest shutdown (or immediately power off)
+    stop [NAME] --confirm-guest-dialog  Opt-in: also press macOS's own Shut Down confirmation once
     ls                          List installed VMs as JSON
     doctor                      Check host support and bundled guest tools
     rename OLD NEW              Rename a stopped VM, preserving identity and guest data

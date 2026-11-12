@@ -154,6 +154,18 @@ final class GuestRuntime: NSObject {
                 }
                 do { values["text"] = try ClipboardTransfer.guestCopyText(NSPasteboard.general.string(forType: .string)) }
                 catch { throw OutcomeFailure(error.localizedDescription, outcome: .confirmedNoCopy) }
+            case GuestStopConfirmation.guestAction:
+                guard request.arguments.isEmpty else { throw OutcomeFailure("SHUTDOWN_DIALOG_INVALID", outcome: .noEffect) }
+                try requireAccessibility()
+                guard let button = systemShutdownButton() else {
+                    throw OutcomeFailure("SHUTDOWN_DIALOG_ABSENT", outcome: .noEffect)
+                }
+                try request.requireLive()
+                effects.begin()
+                guard AXUIElementPerformAction(button, kAXPressAction as CFString) == .success else {
+                    throw OutcomeFailure("SHUTDOWN_DIALOG_PRESS_UNCONFIRMED", outcome: .mutationUnknown)
+                }
+                values = ["pressed": "true"]
             case "status":
                 let bounds = CGDisplayBounds(CGMainDisplayID())
                 let terminal = terminalFocusEvidence()
@@ -290,6 +302,29 @@ final class GuestRuntime: NSObject {
             try? mailbox.respond(Reply(id: request.id, values: (error as? OutcomeFailure)?.values ?? [:],
                                        error: error.localizedDescription, outcome: outcome))
         }
+    }
+    /// The system's own shutdown confirmation button, or nil. Searches only the
+    /// loginwindow process's windows, bounded in depth; never another app.
+    func systemShutdownButton() -> AXUIElement? {
+        guard let owner = NSRunningApplication.runningApplications(
+            withBundleIdentifier: GuestStopConfirmation.ownerBundle).first else { return nil }
+        let application = AXUIElementCreateApplication(owner.processIdentifier)
+        func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+            var value: CFTypeRef?
+            return AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success ? value : nil
+        }
+        func search(_ element: AXUIElement, depth: Int) -> AXUIElement? {
+            if GuestStopConfirmation.isSystemShutdownButton(ownerBundle: owner.bundleIdentifier,
+                    role: attribute(element, kAXRoleAttribute) as? String,
+                    title: attribute(element, kAXTitleAttribute) as? String) { return element }
+            guard depth < GuestStopConfirmation.maximumDepth,
+                  let children = attribute(element, kAXChildrenAttribute) as? [AXUIElement] else { return nil }
+            for child in children { if let found = search(child, depth: depth + 1) { return found } }
+            return nil
+        }
+        guard let windows = attribute(application, kAXWindowsAttribute) as? [AXUIElement] else { return nil }
+        for window in windows { if let found = search(window, depth: 0) { return found } }
+        return nil
     }
     func requireAccessibility() throws {
         guard AXIsProcessTrusted() else { throw Failure("Allow Accessibility for TerminalMacGuest inside the VM") }

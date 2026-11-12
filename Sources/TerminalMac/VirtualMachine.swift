@@ -113,6 +113,10 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
     var loop: Task<Void, Never>?
     var stopping = false
     var stopDeadline: Date?
+    /// Set when a requested guest shutdown has not powered off within the window.
+    /// macOS answers the virtual power button with its own confirmation dialog;
+    /// nothing confirms it automatically, so report the wait honestly.
+    var awaitingGuestConfirmation = false
     /// The lease owner that deliberately showed the native window, so that owner's lease keeps
     /// the window interactive (owner sign-in); a foreign holder makes it non-interactive.
     var windowOwner: String?
@@ -139,8 +143,9 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
                 do { for request in try mailbox.requests() { await handle(request) } }
                 catch { stderr(error.localizedDescription) }
                 if let stopDeadline, Date() > stopDeadline {
-                    stderr("Guest shutdown is taking longer than 60 seconds. Use stop --force if needed.")
+                    stderr("Guest has not powered off within 60 seconds; macOS may be waiting at its shutdown confirmation. Use stop --confirm-guest-dialog or stop --force.")
                     self.stopDeadline = nil
+                    self.awaitingGuestConfirmation = true
                 }
                 try? await Task.sleep(nanoseconds: 100_000_000)
             }
@@ -210,7 +215,8 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
     var stateName: String {
         switch vm.state {
         case .stopped: return "stopped"
-        case .running: return stopping ? "stopping" : "running"
+        case .running:
+            return stopping ? (awaitingGuestConfirmation ? GuestStopConfirmation.awaitingState : "stopping") : "running"
         case .paused: return "paused"
         case .starting: return "starting"
         case .pausing: return "pausing"
