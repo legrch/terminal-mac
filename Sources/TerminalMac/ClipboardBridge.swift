@@ -33,9 +33,35 @@ enum ClipboardBridge {
     }
 }
 
+/// Native-window transfers use the same durable custody as CLI/MCP dispatch.
+/// The window may borrow its deliberate holder's lease, but cannot adopt a
+/// foreign owner or reset an unknown result when the shortcut task ends.
+@MainActor
+final class NativeClipboardCustody {
+    private let directory: URL
+    private let windowOwner: () -> String?
+    private let nativeOwner = "native:" + UUID().uuidString.lowercased()
+    private var outcome = GuestSessionOutcomeGuard()
+    var isUnconfirmed: Bool { outcome.isUnconfirmed }
+    init(directory: URL, windowOwner: @escaping () -> String?) {
+        self.directory = directory; self.windowOwner = windowOwner
+    }
+    func perform(request: Request, mailbox: Mailbox, effect: () async throws -> Void) async throws {
+        try outcome.requireAllowed(action: request.action)
+        let custody = try GuestInputCustody.begin(directory: directory, mailbox: mailbox,
+            request: request, claimedOwner: windowOwner() ?? nativeOwner)
+        do { try await custody.perform(effect) }
+        catch {
+            if InputQueue.disposition(for: error) == .stop { outcome.markUnconfirmed() }
+            throw error
+        }
+    }
+}
+
 @MainActor
 final class ClipboardMachineView: VZVirtualMachineView {
     var clipboardMailbox: Mailbox?
+    var clipboardCustody: NativeClipboardCustody?
     /// Returns the foreign lease owner that currently holds guest input, or nil when native
     /// window input is allowed. Wired by MachineRuntime so the window is demonstrably
     /// non-interactive while a scenario owns the lease; the holder that deliberately opened the
@@ -46,7 +72,9 @@ final class ClipboardMachineView: VZVirtualMachineView {
     private func denied() -> Bool {
         // A view without its runtime gate must not silently become interactive.
         let holder: String
-        if let inputGate {
+        if clipboardCustody?.isUnconfirmed == true {
+            holder = "an unresolved native clipboard transfer (reconciliation required)"
+        } else if let inputGate {
             guard let reason = inputGate() else { return false }
             holder = reason
         } else {
@@ -81,7 +109,7 @@ final class ClipboardMachineView: VZVirtualMachineView {
               let mailbox = clipboardMailbox else {
             return false
         }
-        guard !transferring else { NSSound.beep(); return true }
+        guard !transferring, let custody = clipboardCustody else { NSSound.beep(); return true }
         let request: Request?
         do {
             request = shortcut == .paste ? try ClipboardBridge.pasteRequest() :
@@ -93,8 +121,11 @@ final class ClipboardMachineView: VZVirtualMachineView {
         Task { @MainActor in
             defer { transferring = false }
             do {
-                if let request { _ = try await mailbox.call(request) }
-                else { try await ClipboardBridge.copy(mailbox, request: copyRequest, expectedHostRevision: revision) }
+                guard let transfer = request ?? copyRequest else { throw OutcomeFailure("Missing clipboard request", outcome: .noEffect) }
+                try await custody.perform(request: transfer, mailbox: mailbox) {
+                    if let request { _ = try await mailbox.call(request) }
+                    else { try await ClipboardBridge.copy(mailbox, request: transfer, expectedHostRevision: revision) }
+                }
                 stderr("Clipboard transfer completed: \(shortcut)")
             } catch { stderr("Clipboard: \(error.localizedDescription)"); NSSound.beep() }
         }
