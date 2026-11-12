@@ -75,6 +75,47 @@ enum GuestProcessCensus {
         try AppLaunchIdentity.stableCensus { try captureOnce() }
     }
 
+    /// Quit/close need the whole application registry, including entries whose
+    /// original processes have already exited. The launch census deliberately
+    /// joins live PIDs; reusing that join here would hide delayed registry
+    /// removal and could falsely attest a completely drained application.
+    ///
+    /// This is one complete read attempt. An unreadable/torn process sample is
+    /// never downgraded to a positive survivor, omitted, or retried by the Quit
+    /// drain loop. The caller's original deadline/cancellation/custody check
+    /// runs throughout the bounded enumeration.
+    static func captureForQuit(check: () throws -> Void) throws -> AppProcessCensus {
+        try GuestGuard.requireVirtualMac()
+        try Task.checkCancellation()
+        try check()
+        let before = try pids()
+        var processes: [AppProcessSnapshot] = []
+        for pid in before {
+            try Task.checkCancellation()
+            try check()
+            guard let process = try GuestProcessCensus.process(pid), process.uid == geteuid() else {
+                throw AppLaunchIdentityError.censusChanged
+            }
+            processes.append(process)
+        }
+        // Do not filter by PID membership, isTerminated or activationPolicy:
+        // each accepted-tree registry entry must disappear observably. Unknown
+        // registry metadata is handled fail-closed by the frozen Core policy.
+        let apps = NSWorkspace.shared.runningApplications
+        guard apps.count <= AppLaunchIdentity.maximumApplications else {
+            throw AppLaunchIdentityError.censusUnavailable
+        }
+        let applications = apps.map {
+            AppGUIObservation(pid: $0.processIdentifier, bundlePath: $0.bundleURL?.path ?? "",
+                              bundleID: $0.bundleIdentifier ?? "", executable: $0.executableURL?.path ?? "",
+                              regular: $0.activationPolicy == .regular)
+        }
+        guard before == (try pids()) else { throw AppLaunchIdentityError.censusChanged }
+        try Task.checkCancellation()
+        try check()
+        return AppProcessCensus(processes: processes, applications: applications, complete: true)
+    }
+
     private static func captureOnce() throws -> AppProcessCensus {
         try GuestGuard.requireVirtualMac()
         let before = try pids()
@@ -184,6 +225,9 @@ final class GuestApplicationLifecycle {
     private var primaryObserver: GuestOriginalProcessObserver?
     private(set) var failure: AppLaunchIdentityError?
     private var quitIssued = false
+    private var quitDrain: AppQuitDrain?
+    private var quitProgress: AppQuitDrainProgress?
+    private var quitInventoryReadAttempts = 0
 
     init(plan: AppLaunchPlan, before: AppProcessCensus, notBefore: AppProcessKey) {
         self.plan = plan; self.before = before; self.notBefore = notBefore
@@ -260,42 +304,77 @@ final class GuestApplicationLifecycle {
     }
 
     func quit(check: () throws -> Void) async throws {
-        guard !quitIssued, binding != nil, failure == nil else { throw AppLaunchIdentityError.exitUnconfirmed }
+        guard !quitIssued, let binding, let returnedProcess, failure == nil else {
+            throw AppLaunchIdentityError.exitUnconfirmed
+        }
+        try Task.checkCancellation()
+        try check()
         let primaryLife = primaryObserver?.life() ?? .unknown
         let rootLife = rootObserver?.life() ?? .unknown
         try AppLaunchIdentity.requireNormalQuitAdmission(root: rootLife, primary: primaryLife)
         let app = try requireLive()
-        try check()
-        quitIssued = true  // An unsuccessful terminate is never retried.
-        guard app.terminate() else { throw AppLaunchIdentityError.exitUnconfirmed }
-        while true {
-            try check()
-            let primary = primaryObserver?.life() ?? .unknown
-            let root = rootObserver?.life() ?? .unknown
-            guard primary != .unknown, root != .unknown else { throw AppLaunchIdentityError.exitUnconfirmed }
-            if primary == .exited && root == .exited { break }
-            // The original root may still own updater descendants. Wait only;
-            // never signal the root to manufacture a successful normal Quit.
+
+        // Freeze the currently proved descendants/registry BEFORE terminate.
+        // Rebinding is only a comparison with the original root/primary; it
+        // creates no observer, process authority or new lifecycle. Accepted
+        // processes first seen after this boundary cannot be adopted as ours.
+        let beforeQuit = try GuestProcessCensus.captureForQuit(check: check)
+        let confirmed = try AppLaunchIdentity.bind(plan: plan, before: before,
+            after: beforeQuit, returned: returnedProcess.key, notBefore: notBefore, uid: geteuid())
+        try AppLaunchIdentity.requireSameBinding(binding, confirmed)
+        let drain = try AppQuitDrain(plan: plan, binding: confirmed, beforeQuit: beforeQuit)
+        quitDrain = drain
+        quitProgress = nil
+        quitInventoryReadAttempts = 0
+
+        try await drain.run(check: check, terminatePrimary: {
+            guard !self.quitIssued, !app.isTerminated,
+                  app.processIdentifier == binding.primary.key.pid,
+                  self.primaryApplication === app else {
+                throw AppLaunchIdentityError.changedIdentity
+            }
+            self.quitIssued = true  // Even a false return is never retried.
+            return app.terminate()   // The only normal termination request.
+        }, originals: {
+            (root: self.rootObserver?.life() ?? .unknown,
+             primary: self.primaryObserver?.life() ?? .unknown)
+        }, inventory: {
+            self.quitInventoryReadAttempts += 1
+            return try GuestProcessCensus.captureForQuit(check: check)
+        }, nextObservation: {
+            // Scheduling cadence ONLY. Each new sample rechecks the original
+            // request deadline/cancellation; elapsed time never proves exit.
             try await Task.sleep(nanoseconds: 50_000_000)
-        }
-        try requireExited()
+        }, observed: { progress in
+            self.quitProgress = progress
+        })
         try check()
     }
 
-    func requireExited() throws {
-        guard let binding, rootObserver?.life() == .exited, primaryObserver?.life() == .exited else {
+    func requireExited(check: () throws -> Void) throws {
+        // Close does its own fresh kernel/census check, not a cached successful
+        // Quit or another round of cleanup. An earlier UNKNOWN is never healed.
+        guard failure == nil, quitIssued, let binding, let drain = quitDrain else {
             throw AppLaunchIdentityError.exitUnconfirmed
         }
-        // This proves no currently observed process runs these app bytes, not
-        // arbitrary descendant cleanup. Detached unrelated paths stay unverified.
-        let census = try GuestProcessCensus.capture()
-        guard census.complete, !census.processes.contains(where: { plan.contains($0.executable) }),
-              !census.applications.contains(where: { plan.containsBundle($0.bundlePath) }) else {
-            throw AppLaunchIdentityError.exitUnconfirmed
-        }
+        try Task.checkCancellation()
+        try check()
         guard primaryApplication?.processIdentifier == binding.primary.key.pid else {
             throw AppLaunchIdentityError.changedIdentity
         }
+        guard try AppQuitDrain.originalsExited(root: rootObserver?.life() ?? .unknown,
+                                              primary: primaryObserver?.life() ?? .unknown) else {
+            throw AppLaunchIdentityError.exitUnconfirmed
+        }
+        quitInventoryReadAttempts += 1
+        let census = try GuestProcessCensus.captureForQuit(check: check)
+        try drain.requireQuiescent(root: rootObserver?.life() ?? .unknown,
+                                   primary: primaryObserver?.life() ?? .unknown, census: census)
+        try Task.checkCancellation()
+        try check()
+        quitProgress = .quiescent
+        // No claim about arbitrary detached descendants on unrelated paths.
+        // GuestAppService.close still separately verifies the installed tree.
     }
 
     func note(_ error: Error) {
@@ -316,6 +395,27 @@ final class GuestApplicationLifecycle {
             "applicationRunning": "unconfirmed", "descendantCleanup": "unverified",
             "normalQuitRequested": String(quitIssued)
         ]
+        values["quitInventoryReadAttempts"] = String(quitInventoryReadAttempts)
+        switch quitProgress {
+        case .some(.originalExitsPending(_, _)):
+            values["quitDrainState"] = "original-exits-pending"
+        case .some(.inventoryPending(let processes, let applications)):
+            values["quitDrainState"] = "accepted-inventory-pending"
+            values["quitResidualProcesses"] = String(processes)
+            values["quitResidualApplications"] = String(applications)
+        case .some(.quiescent):
+            values["quitDrainState"] = "observed-quiescent"
+            values["quitResidualProcesses"] = "0"
+            values["quitResidualApplications"] = "0"
+        case .none:
+            values["quitDrainState"] = "not-observed"
+        }
+        if failure != nil, quitIssued {
+            // A later expired request or failed close cannot reuse a previous
+            // empty sample as current completion evidence.
+            values["quitLastObservation"] = values["quitDrainState"]
+            values["quitDrainState"] = "unconfirmed"
+        }
         if let identifier = returned?.bundleIdentifier, !identifier.isEmpty, identifier.utf8.count <= 160,
            identifier.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) ||
                (97...122).contains($0) || [45, 46].contains($0) }) {

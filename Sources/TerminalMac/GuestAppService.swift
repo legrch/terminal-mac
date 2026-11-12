@@ -360,7 +360,7 @@ final class GuestAppService {
                 try next.complete("quit")
             case "close":
                 if let lifecycle {
-                    try lifecycle.requireExited()
+                    try lifecycle.requireExited { try self.check(request, owner: command.owner) }
                     try retainLaunchEvidence("lifecycle", command: command)
                 }
                 // Verify the installed application tree again after Quit.

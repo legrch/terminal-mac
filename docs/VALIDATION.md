@@ -134,3 +134,22 @@ remain permitted after expiry. The original failed run remains unresolved.
 invalid/regressing elapsed values. Build14 packages successfully. Guest base
 permissions were re-confirmed through normal UI; fresh-clone live qualification
 of this timebase fix must be recorded separately.
+
+### Quit-inventory drain checkpoint (November 12, 2026)
+
+The fresh official helper14 run issued one normal Quit, then reported unknown;
+a later bound read-only observation showed both original process exits. The
+one-shot post-exit inventory check could reject delayed accepted helpers or
+LaunchServices registry entries. The corrected live policy freezes complete
+pre-Quit identities, issues terminate once, and observes original exits before
+waiting only on unchanged known process/registry survivors. Incomplete/torn
+reads, new accepted processes and changed identities still freeze the run.
+Close performs an independent fresh census and installed-tree verification.
+The native close adapter now supplies the original custody/deadline check; it
+has no silent unchecked default.
+
+217 XCTest cases pass (including 26 new quit-drain regressions), and the
+integrated helper15 package builds. The original UNKNOWN remains unchanged.
+Fresh guest qualification of helper15 is a separate pending gate. No force
+application termination, PID-name acquisition or historical fence cleanup was
+introduced. Arbitrary detached-descendant cleanup remains unverified.
