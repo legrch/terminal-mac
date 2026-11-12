@@ -12,6 +12,10 @@ public final class AppServiceDirectory {
     deinit { close(fd) }
 
     public static func open(_ url: URL, createLeaf: Bool = false, privateDirectory: Bool = false) throws -> AppServiceDirectory {
+        try open(url, createLeaf: createLeaf, privateDirectory: privateDirectory, syncParent: { fsync($0) })
+    }
+    static func open(_ url: URL, createLeaf: Bool, privateDirectory: Bool = false,
+                     syncParent: (Int32) -> Int32) throws -> AppServiceDirectory {
         let components = url.pathComponents
         guard url.isFileURL, components.first == "/", !components.contains("..") else { throw AppServiceContract.refuse("APP_SERVICE_UNSAFE_PATH") }
         var current = Darwin.open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
@@ -21,6 +25,9 @@ public final class AppServiceDirectory {
                 guard !name.isEmpty, name != ".", name != "..", !name.contains("/") else { throw AppServiceContract.refuse("APP_SERVICE_UNSAFE_PATH") }
                 if createLeaf && index == components.count - 2 {
                     if mkdirat(current, name, 0o700) != 0 && errno != EEXIST { throw AppServiceContract.refuse("APP_SERVICE_IO") }
+                    // Inner file/directory syncs cannot make this root's name durable.
+                    // Sync even an existing leaf: a prior failed attempt may have created it.
+                    guard syncParent(current) == 0 else { throw AppServiceContract.refuse("APP_SERVICE_PUBLICATION_UNKNOWN") }
                 }
                 let next = openat(current, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
                 guard next >= 0 else { throw AppServiceContract.refuse("APP_SERVICE_UNSAFE_PATH") }
