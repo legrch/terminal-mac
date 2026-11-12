@@ -165,3 +165,29 @@ sampler, with original custody/deadline checks in every attempt. No partial
 snapshot is accepted and no application effect is repeated. Post-terminate
 drain and close still fail immediately on an unreadable/torn sample. All 217
 XCTest cases pass; helper16 live qualification remains pending.
+
+### Helper16 live qualification (November 12, 2026)
+
+Source `e7ab429` / installed build16 passed fresh `farol-qa-15` official
+0.5.22 install, launch, activation, normal Quit, distinct-PID relaunch,
+second normal Quit and close. Independent relaunch observation found one
+window; final installed tree verified at close. All 217 XCTest cases pass.
+
+Farol source `54b407a9` default `task vm:dev` also passed in a fresh hidden
+clone with inherited login and both TCC grants. MCP admitted guest screenshot,
+click, key and literal text input; clean EOF exited zero with immutable CLOSED,
+both original exits and final installed-tree verification. The lease was free
+afterward and the guest shut down normally.
+
+After its clean accepted lifecycle, qa15's separate generic MCP journey
+qualified the real 0.5.22→0.5.23 updater: completed guest journal, released
+archive, successor build ID, rendered Home and normal Quit/reopen UI. This does
+not qualify provider/account tools, arbitrary descendants or formal review.
+Earlier UNKNOWN runs retain their disks/fences and are not replayed or healed.
+
+For an ad-hoc helper update, Finder may activate the existing installed helper
+instead of starting the newer shared app. In a positively identified guest
+Terminal, normal `open -n '/Volumes/My Shared Files/tools/TerminalMacGuest.app'`
+started the normal installer. Its guest service/lease guards still applied.
+Re-add only the installed guest app through normal macOS permission UI when
+ad-hoc signing changes; never reset TCC databases or change host security.
