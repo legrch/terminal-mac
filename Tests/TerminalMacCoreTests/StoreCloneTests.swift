@@ -163,4 +163,20 @@ final class StoreCloneTests: XCTestCase {
         XCTAssertEqual(try store.load("farol-base-1").name, "farol-base-1")
         XCTAssertEqual(try store.load("suite-b").name, "suite-b")
     }
+    func testCloneHoldsRuntimeAndInputCustodyDuringCopy() throws {
+        let (store, root) = try store()
+        try machine("pilot", in: root)
+        let source = try store.directory("pilot")
+        var checked = false
+        try store.clone(from: "pilot", to: "copy", identityData: Data("fresh".utf8), beforeCopy: {
+            checked = true
+            XCTAssertThrowsError(try FileLock(source.appendingPathComponent("runtime.lock")))
+            XCTAssertThrowsError(try InputLease.acquire(directory: source, owner: "competitor", generation: 2))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("machines/copy/clone.json").path))
+        })
+        XCTAssertTrue(checked)
+        XCTAssertNoThrow(try FileLock(source.appendingPathComponent("runtime.lock")))
+        XCTAssertEqual(try InputLease.probe(directory: source), .free)
+    }
+
 }

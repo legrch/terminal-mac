@@ -109,4 +109,20 @@ final class StoreRenameTests: XCTestCase {
         XCTAssertEqual(detected.name, "pilot")
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("machines/final").path))
     }
+    func testRenameHoldsRuntimeAndInputCustodyThroughDirectoryMove() throws {
+        let (store, root) = try store()
+        try machine("pilot", in: root)
+        let source = try store.directory("pilot")
+        var checked = false
+        try store.rename("pilot", to: "renamed", beforeMove: {
+            checked = true
+            XCTAssertThrowsError(try FileLock(source.appendingPathComponent("runtime.lock")))
+            XCTAssertThrowsError(try InputLease.acquire(directory: source, owner: "competitor", generation: 2))
+        })
+        XCTAssertTrue(checked)
+        let destination = try store.directory("renamed")
+        XCTAssertEqual(try InputLease.probe(directory: destination), .free)
+        XCTAssertNoThrow(try FileLock(destination.appendingPathComponent("runtime.lock")))
+    }
+
 }

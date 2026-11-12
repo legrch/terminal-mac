@@ -162,6 +162,9 @@ public struct Store {
     /// detected instead of silently adopted. Historical evidence inside the machine directory
     /// moves unchanged; the receipt records the old→new mapping.
     public func rename(_ from: String, to: String) throws {
+        try rename(from, to: to, beforeMove: {})
+    }
+    func rename(_ from: String, to: String, beforeMove: () throws -> Void) throws {
         try validateName(from)
         try validateName(to)
         guard from != to else { throw Failure("Renaming '\(from)' to itself changes nothing") }
@@ -176,22 +179,19 @@ public struct Store {
         }
         let lock = open(source.appendingPathComponent("runtime.lock").path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard lock >= 0 else { throw Failure("Cannot verify '\(from)' is stopped") }
-        var running = false
-        if flock(lock, LOCK_EX | LOCK_NB) == 0 { flock(lock, LOCK_UN) } else { running = true }
-        close(lock)
-        guard !running else { throw Failure("VM '\(from)' is running. Stop it with: terminal-mac stop \(from)") }
-        switch try InputLease.probe(directory: source) {
-        case .free: break
-        case .held(let owner, _):
-            throw Failure("Guest input is locked by \(owner); wait for it to finish before renaming")
-        case .heldUnknown:
-            throw Failure("Guest input is locked by another client with unavailable identity; refuse renaming")
-        case .unresolved:
-            throw Failure("Previous guest input operation is unresolved; refuse renaming until retained evidence is reconciled")
+        defer { flock(lock, LOCK_UN); close(lock) }
+        guard flock(lock, LOCK_EX | LOCK_NB) == 0 else {
+            throw Failure("Cannot exclusively lock stopped VM '\(from)' for renaming")
         }
+        let input = try InputLease.acquire(directory: source, owner: "rename:" + UUID().uuidString, generation: 0)
+        var custodyDirectory = source
+        defer { input.release(relocatedDirectory: custodyDirectory) }
+        _ = try load(from)
+        try beforeMove()
         guard Darwin.rename(source.path, destination.path) == 0 else {
             throw Failure("Cannot rename machine directory: \(String(cString: strerror(errno)))")
         }
+        custodyDirectory = destination
         try Self.completeRename(destination: destination, from: from, to: to)
     }
 
@@ -219,6 +219,10 @@ public struct Store {
     /// destination is created new or not at all. The receipt binds provenance: a COW clone's
     /// disk bytes equal the source disk at clone time.
     public func clone(from: String, to: String, identityData: Data, offline: Bool = false) throws {
+        try clone(from: from, to: to, identityData: identityData, offline: offline, beforeCopy: {})
+    }
+    func clone(from: String, to: String, identityData: Data, offline: Bool = false,
+               beforeCopy: () throws -> Void) throws {
         try validateName(from)
         try validateName(to)
         guard from != to else { throw Failure("Cloning '\(from)' to itself changes nothing") }
@@ -233,19 +237,14 @@ public struct Store {
         }
         let lock = open(source.appendingPathComponent("runtime.lock").path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard lock >= 0 else { throw Failure("Cannot verify '\(from)' is stopped") }
-        var running = false
-        if flock(lock, LOCK_EX | LOCK_NB) == 0 { flock(lock, LOCK_UN) } else { running = true }
-        close(lock)
-        guard !running else { throw Failure("VM '\(from)' is running. Stop it with: terminal-mac stop \(from)") }
-        switch try InputLease.probe(directory: source) {
-        case .free: break
-        case .held(let owner, _):
-            throw Failure("Guest input is locked by \(owner); wait for it to finish before cloning")
-        case .heldUnknown:
-            throw Failure("Guest input is locked by another client with unavailable identity; refuse cloning")
-        case .unresolved:
-            throw Failure("Previous guest input operation is unresolved; refuse cloning until retained evidence is reconciled")
+        defer { flock(lock, LOCK_UN); close(lock) }
+        guard flock(lock, LOCK_EX | LOCK_NB) == 0 else {
+            throw Failure("Cannot exclusively lock stopped VM '\(from)' for cloning")
         }
+        let input = try InputLease.acquire(directory: source, owner: "clone:" + UUID().uuidString, generation: 0)
+        defer { input.release() }
+        _ = try load(from)
+        try beforeCopy()
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         // The destination is new, so any failure removes the partial directory instead of leaving it.
         do { try Self.copyMachine(from: from, to: to, source: source, destination: destination,

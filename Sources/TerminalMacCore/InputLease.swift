@@ -116,11 +116,11 @@ public final class InputLease {
     /// A clean release removes only this acquisition's exact metadata inode and bytes.
     /// An unresolved action, lost marker-release ACK or abnormal exit retains the record;
     /// releasing flock alone never proves an issued guest effect finished.
-    public func release(preserveMetadata: Bool = false) {
+    public func release(preserveMetadata: Bool = false, relocatedDirectory: URL? = nil) {
         guard !released else { return }
         released = true
         if !preserveMetadata {
-            Self.removeOwnedMetadata(directory: directory, receipt: metadataReceipt)
+            Self.removeOwnedMetadata(directory: relocatedDirectory ?? directory, receipt: metadataReceipt)
         }
         _ = flock(fd, LOCK_UN)
         close(fd)
