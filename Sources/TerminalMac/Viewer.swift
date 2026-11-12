@@ -49,7 +49,7 @@ final class TerminalViewer {
     private var failure: Error?
     /// A failed/abandoned input may still have affected the guest. Keep the
     /// update inhibitor for reconciliation instead of releasing it on exit.
-    private var guestOutcomeUnconfirmed = false
+    private(set) var guestOutcomeUnconfirmed = false
     private var quit = false, link = Link.connecting, palette = false
     private var queue: [Request] = [], labels: [UUID: String] = [:], inFlight = false
     private var anchor: (x: Int, y: Int, at: Date)?, lastClick: (x: Int, y: Int, at: Date, count: Int)?
@@ -68,7 +68,8 @@ final class TerminalViewer {
     /// Set once a guest helper has answered, so later runs of `up` can skip the native setup window.
     static func readyMarker(_ directory: URL) -> URL { directory.appendingPathComponent("guest-ready") }
 
-    init(directory: URL, machine: Machine, graphics: String?, readOnly: Bool) throws {
+    init(directory: URL, machine: Machine, graphics: String?, readOnly: Bool,
+         requireInteractiveTerminal: Bool = true) throws {
         mailbox = try Mailbox(directory.appendingPathComponent("exchange"))
         host = try Mailbox(directory.appendingPathComponent("host-control"), create: true)
         self.directory = directory; self.machine = machine; self.readOnly = readOnly
@@ -79,8 +80,8 @@ final class TerminalViewer {
         guard let selected = graphics ?? detected, ["kitty", "iterm"].contains(selected) else {
             throw Failure("Use Ghostty, Kitty or iTerm2 for inline graphics, or choose --protocol kitty|iterm. Use 'show' for a native window in other terminals. tmux passthrough is not implemented.")
         }
-        guard isatty(STDIN_FILENO) == 1, isatty(STDOUT_FILENO) == 1 else { throw Failure("view needs an interactive terminal") }
-        if env["TMUX"] != nil { throw Failure("Run view outside tmux for now; graphics passthrough is not implemented") }
+        guard !requireInteractiveTerminal || (isatty(STDIN_FILENO) == 1 && isatty(STDOUT_FILENO) == 1) else { throw Failure("view needs an interactive terminal") }
+        if requireInteractiveTerminal && env["TMUX"] != nil { throw Failure("Run view outside tmux for now; graphics passthrough is not implemented") }
         self.graphics = selected
         // Kitty-protocol terminals start on PNG until they confirm shared memory support.
         renderer = DesktopRenderer(writer: writer, transport: selected == "iterm" ? .iterm : .kittyDirect)
@@ -259,6 +260,10 @@ final class TerminalViewer {
         Task { @MainActor in _ = try? await host.call(Request(action: "hide", timeout: 5)) }
     }
     private func openLoginWindow() {
+        guard !guestOutcomeUnconfirmed else {
+            record("Guest input outcome is unconfirmed; reconcile the original operation first", ok: false)
+            return
+        }
         loginWindow = true
         record("Opened the VM window · it hides once the guest is ready", ok: true)
         Task { @MainActor in
@@ -461,7 +466,8 @@ final class TerminalViewer {
     // MARK: Input
 
     /// Input runs one request at a time, in order, without ever blocking drawing or typing.
-    private func enqueue(_ action: String, _ arguments: [String: String], label: String) {
+    func enqueue(_ action: String, _ arguments: [String: String], label: String) {
+        guard !guestOutcomeUnconfirmed else { return }
         if action == "type", let last = queue.last, last.action == "type", let previous = last.arguments["text"],
            previous.utf8.count + (arguments["text"]?.utf8.count ?? 0) < 32768 {
             let text = previous + (arguments["text"] ?? "")
@@ -472,13 +478,14 @@ final class TerminalViewer {
         let request = Request(action: action, arguments: arguments, timeout: 5)
         enqueue(request, label: label)
     }
-    private func enqueue(_ request: Request, label: String) {
+    func enqueue(_ request: Request, label: String) {
+        guard !guestOutcomeUnconfirmed else { return }
         guard queue.count < 64 else { record("Input is busy; wait a moment", ok: false); return }
         labels[request.id] = label
         queue.append(request)
     }
-    private func sendNextInput() {
-        guard !inFlight, !queue.isEmpty else { return }
+    func sendNextInput() {
+        guard !guestOutcomeUnconfirmed, !inFlight, !queue.isEmpty else { return }
         let request = queue.removeFirst(), label = labels.removeValue(forKey: request.id) ?? request.action
         inFlight = true
         Task { @MainActor in
