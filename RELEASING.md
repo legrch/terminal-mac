@@ -33,6 +33,7 @@ Increment the positive integer `BUILD_NUMBER` for each build: installed guest he
 Settings in `scripts/release-config.sh`:
 
 - Signing identity: `SIGNING_NAME` (default "Govijr Code Signing"); `SIGN_IDENTITY` overrides it, and `SIGN_IDENTITY=-` signs ad-hoc.
+- Signing keychain: `SIGN_KEYCHAIN` (optional absolute path) uses a dedicated, unlocked build keychain without adding it to the user's search list.
 - Notary profile (only `--notarized`): `NOTARY_PROFILE`, created with `xcrun notarytool store-credentials PROFILE`. Credentials stay in the Keychain.
 - Host bundle: `dev.terminal-mac.host`; guest bundle: `dev.terminal-mac.guest`.
 - Architecture: arm64; minimum macOS: 14.
