@@ -176,7 +176,15 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
         do {
             var values: [String: String] = [:]
             switch request.action {
-            case "status": values = ["name": machine.name, "state": stateName, "pid": String(getpid())]
+            case "status":
+                let shares = vm.directorySharingDevices.compactMap {
+                    ($0 as? VZVirtioFileSystemDevice)?.share as? VZMultipleDirectoryShare
+                }
+                let artifacts = shares.compactMap { $0.directories["artifacts"] }
+                let expected = directory.appendingPathComponent("artifacts").standardizedFileURL
+                let readOnly = artifacts.count == 1 && artifacts[0].isReadOnly && artifacts[0].url.standardizedFileURL == expected
+                values = ["name": machine.name, "state": stateName, "pid": String(getpid()),
+                          "artifactShareReadOnly": String(readOnly), "artifactShareEvidence": "live-vz-configuration/1"]
             case "show":
                 windowOwner = request.arguments["leaseOwner"]
                 showWindow()

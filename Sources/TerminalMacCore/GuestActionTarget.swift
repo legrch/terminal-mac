@@ -6,7 +6,7 @@ public struct GuestActionTarget {
     public static let actions: Set<String> = [
         "status", "screenshot", "snapshot", "click", "move", "drag", "scroll",
         "type", "key", "clipboard-paste", "clipboard-copy",
-        "terminal-open", "terminal-type", "terminal-key"
+        "terminal-open", "terminal-type", "terminal-key", "app-service"
     ]
 
     public let name: String

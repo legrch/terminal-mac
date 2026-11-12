@@ -4,6 +4,22 @@ import TerminalMacCore
 
 @MainActor
 enum GuestBootstrap {
+    /// New installers and native application sessions share this guest-local
+    /// lock. Never terminate/replace the installed helper while its service
+    /// owns it, or while a predecessor left unresolved private evidence.
+    private static func serviceUpdateLease() throws -> AppServiceLock {
+        try GuestGuard.requireVirtualMac()
+        let root = try AppServiceDirectory.open(GuestAppService.rootURL, createLeaf: true, privateDirectory: true)
+        let lease = try root.lock()
+        guard !AppServiceFiles.hasUnresolved(in: GuestAppService.rootURL) else {
+            throw AppServiceContract.refuse("APP_SERVICE_UNRESOLVED")
+        }
+        let mailbox = try Mailbox(URL(fileURLWithPath: "/Volumes/My Shared Files/control"))
+        guard mailbox.helperUpdateDisposition().mayUpdate else {
+            throw AppServiceContract.refuse("APP_SERVICE_CUSTODY")
+        }
+        return lease
+    }
     static func installAndRelaunchIfNeeded() async throws -> Bool {
         try GuestGuard.requireVirtualMac()
         guard Bundle.main.bundleIdentifier == "dev.terminal-mac.guest" else { return false }
@@ -13,6 +29,8 @@ enum GuestBootstrap {
         let applications = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications")
         let destination = applications.appendingPathComponent("TerminalMacGuest.app")
         if source == destination.resolvingSymlinksInPath() { return false }
+        let updateLease = try serviceUpdateLease()
+        defer { withExtendedLifetime(updateLease) {} }
         try FileManager.default.createDirectory(at: applications, withIntermediateDirectories: true)
         let installed = Bundle(url: destination)
         let exists = FileManager.default.fileExists(atPath: destination.path)
@@ -51,7 +69,8 @@ enum GuestBootstrap {
     /// The installed helper hands over to a newer copy in the shared tools folder, which installs
     /// itself over this one and relaunches. Rebuilding terminal-mac on the host is enough to update the guest.
     static func updateFromSharedTools(_ tools: URL) {
-        guard Bundle.main.bundleIdentifier == "dev.terminal-mac.guest" else { return }
+        guard Bundle.main.bundleIdentifier == "dev.terminal-mac.guest",
+              !AppServiceFiles.hasUnresolved(in: GuestAppService.rootURL) else { return }
         let shared = tools.appendingPathComponent("TerminalMacGuest.app")
         guard Bundle.main.bundleURL.resolvingSymlinksInPath() != shared.resolvingSymlinksInPath(),
               let available = Bundle(url: shared)?.object(forInfoDictionaryKey: "CFBundleVersion") as? String, let newer = Int(available),

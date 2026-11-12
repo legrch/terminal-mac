@@ -1,5 +1,33 @@
 # Validation
 
+## Native application service source qualification (November 12, 2026)
+
+The compiled guest service uses `terminal-mac.app-service/4` plus the separately
+advertised `terminal-mac.launch-identity/1` capability. Clients requiring the
+new lifecycle must check both before effects. It accepts data-only payloads
+bound to an independently accepted tree and finite executable-signature policy.
+Installation verifies a private sibling under guest `/Applications` before
+atomic no-overwrite publication; an existing application is never replaced.
+
+Launch root and the unique regular GUI primary have separate native executable,
+PID/start and ancestry bindings. AX/foreground and normal Quit use the proven
+primary; original root exit is separately observed through kernel events. No
+shell, arbitrary argv/environment, force termination, restart adoption or replay
+is available. Returned launch diagnostics survive failed admission. Unknown
+outcomes retain custody, and MCP permits only status/screenshots afterward.
+
+A full native suite at this checkpoint passed 173 tests. These are source/Core
+and compilation results, not installed-helper or live-guest acceptance. New
+helper packaging and a fresh guest lifecycle remain qualification gates. Old
+failed or outcome-unknown runs are not repeated to obtain acceptance.
+
+The desired live receipt is a bound `open → install → launch → activate → quit
+→ close` sequence, plus one separately observed relaunch when selected, with
+create-only intents/receipts, accepted guest path/tree, original process exits,
+foreground AX windows and screenshots. Signature integrity does not prove
+publisher identity, notarization, Gatekeeper approval, provider/tunnel readiness
+or visual semantics. OS warnings and privacy requirements remain in force.
+
 This file distinguishes build/protocol verification from a live macOS guest test. Results are updated after local checks.
 
 ## Automated checks
@@ -60,3 +88,21 @@ Recent source additions are NOT live-qualified; each needs its own guest receipt
 - Stopped rename: run/lease/collision refusals, identity/disk/guest-data preservation across `rename OLD NEW`, helper readiness after restart under the new name, and interrupted-rename detection and recovery.
 
 No inline-terminal rendering, guest privacy grant, guest screenshot or guest input behavior should be described as live-verified until these checks are performed.
+
+### Native application-session checkpoint (November 12, 2026)
+
+The current source has 186 passing XCTest cases and a successful debug package
+(build 12). AppService remains `/4` and separately advertises launch identity
+`terminal-mac.launch-identity/1`. The accepted-manifest launch plan excludes
+accessory/background bundles from regular GUI-primary selection even when their
+vendor plist omits `CFBundleExecutable`; regular and outer bundles remain strict.
+
+Optional MCP application bootstrap binds separately supplied payload/acceptance
+hashes, the original lease owner, launch root and GUI-primary start identities.
+It observes foreground/AX readiness independently, waits only through new
+read-only observations, and retains unresolved effects instead of replaying them.
+Clean EOF requires normal Quit, both original exit observations and final tree
+verification. Pure tests cover the complete positive sequence and negative
+binding, deadline and unknown-outcome cases. This checkpoint is source/native
+qualification; it does not yet establish live MCP readiness or a successful
+installed application lifecycle in the current helper build.

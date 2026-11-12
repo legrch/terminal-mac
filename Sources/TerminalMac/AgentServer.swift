@@ -13,9 +13,14 @@ final class AgentServer {
     let store: Store
     let name: String
     /// Sticky for this session. A crash also leaves the original marker behind.
-    private var guestOutcomeUnconfirmed = false
+    private var outcomeGuard = GuestSessionOutcomeGuard()
+    private let sessionOwner = "mcp:" + UUID().uuidString.lowercased()
     private var guestActionInFlight = false
-    init(store: Store, name: String) { self.store = store; self.name = name }
+    private let appSelection: AppMCPSelection?
+    private var appSession: AppServiceMCPSession?
+    init(store: Store, name: String, appSelection: AppMCPSelection? = nil) {
+        self.store = store; self.name = name; self.appSelection = appSelection
+    }
 
     static let instructions = """
     Controls a separate virtual Mac, not the user's own desktop. Call `screenshot` first; every \
@@ -52,7 +57,7 @@ final class AgentServer {
     func run() async throws {
         // The MCP agent owns guest input while it serves; a competing viewer or scenario is
         // refused at startup instead of interleaving guest actions.
-        let lease = try InputLease.acquire(directory: try store.directory(name), owner: "mcp",
+        let lease = try InputLease.acquire(directory: try store.directory(name), owner: sessionOwner,
                                            generation: Int(Date().timeIntervalSince1970))
         // A long-lived MCP server may be idle longer than the 120-second marker TTL.
         // Publish at acquisition, not only on the next tool request. The new helper
@@ -61,9 +66,10 @@ final class AgentServer {
         let updateBox = try? Mailbox(store.directory(name).appendingPathComponent("exchange"), create: true)
         defer {
             var cleanMarkerRelease = false
-            if markerPublished && !guestOutcomeUnconfirmed && !guestActionInFlight, let updateBox {
+            if markerPublished && !outcomeGuard.isUnconfirmed && !guestActionInFlight &&
+                (appSession?.permitsCleanRelease ?? true), let updateBox {
                 do {
-                    try updateBox.releaseLeaseFlag(ownedBy: "mcp")
+                    try updateBox.releaseLeaseFlag(ownedBy: sessionOwner)
                     cleanMarkerRelease = true
                 } catch { /* Keep both records for reconciliation. */ }
             }
@@ -76,8 +82,28 @@ final class AgentServer {
         // Defence in depth: refuse a marker newly published after acquisition. Only the
         // pre-publication check inside InputLease.acquire protects predecessor metadata.
         try updateBox.requireNoOutstandingUpdateMarker()
-        try updateBox.publishLeaseFlag(owner: "mcp", ttl: 120)
+        // Native app-service has a fixed 600s lifetime; publish ONE marker
+        // with the SAME immutable owner and no timer-based renewal. Generic MCP
+        // retains its original 120s behavior.
+        try updateBox.publishLeaseFlag(owner: sessionOwner,
+                                       ttl: appSelection == nil ? 120 : AppMCPAdmission.budget)
         markerPublished = true
+        if let selection = appSelection {
+            let accepted = AppServiceMCPSession(selection: selection, owner: sessionOwner,
+                                                machineDirectory: try store.directory(name))
+            appSession = accepted
+            do {
+                try await accepted.bootstrap(
+                    host: { request in
+                        try await Mailbox(try self.store.directory(self.name)
+                            .appendingPathComponent("host-control")).call(request)
+                    },
+                    guest: { request in try await self.guest(request) })
+            } catch {
+                if accepted.hasIntent { outcomeGuard.markUnconfirmed() }
+                throw error
+            }
+        }
         for try await line in FileHandle.standardInput.bytes.lines {
             guard let data = line.data(using: .utf8), let message = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 send(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "Parse error"]]); continue
@@ -102,6 +128,22 @@ final class AgentServer {
             default: send(["jsonrpc": "2.0", "id": id, "error": ["code": -32601, "message": "Method not found"]])
             }
         }
+        // Reaching this point is a clean stdio EOF. A crash, thrown stream
+        // read or transport interruption does NOT enter native Quit/close.
+        if let accepted = appSession {
+            // A prior GUI action may have an UNKNOWN outcome independent of
+            // the native app-service sequence. Do not even attempt cleanup
+            // dispatch in that state; the original marker remains retained.
+            guard !outcomeGuard.isUnconfirmed else {
+                throw Failure("MCP guest outcome is unconfirmed; no EOF cleanup dispatched")
+            }
+            do {
+                try await accepted.cleanEOF(guest: { request in try await self.guest(request) })
+            } catch {
+                outcomeGuard.markUnconfirmed()
+                throw error
+            }
+        }
     }
 
     private func call(_ tool: String, _ a: [String: Any]) async throws -> [[String: Any]] {
@@ -118,12 +160,17 @@ final class AgentServer {
             return value
         }
         var requests: [Request] = []
+        if tool != "screenshot" && tool != "status", let accepted = appSession {
+            try accepted.requireInteractiveBudget()
+        }
         switch tool {
         case "screenshot": return try await screenshot()
         case "status":
             let reply = try await guest(Request(action: "status", timeout: 5))
             let summary = reply.values.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)" }.joined(separator: "\n")
-            return [["type": "text", "text": "VM '\(name)' is running.\n" + summary]]
+            let appState = appSession.map { "\n" + $0.summary() } ?? ""
+            let custody = outcomeGuard.isUnconfirmed ? "\nGuest input outcome: UNKNOWN; only status/screenshot allowed." : ""
+            return [["type": "text", "text": "VM '\(name)' is running.\n" + summary + appState + custody]]
         case "click":
             var base = ["x": try int("x"), "y": try int("y")]
             if a["button"] as? String == "right" { base["button"] = "right" }
@@ -174,6 +221,7 @@ final class AgentServer {
 
     private func exchange() throws -> Mailbox { try Mailbox(store.directory(name).appendingPathComponent("exchange")) }
     private func guest(_ request: Request, mailbox: Mailbox? = nil) async throws -> Reply {
+        try outcomeGuard.requireAllowed(action: request.action)
         try requireRunning()
         let box: Mailbox
         if let mailbox { box = mailbox } else { box = try exchange() }
@@ -187,7 +235,7 @@ final class AgentServer {
                failure.outcome == .noEffect || failure.outcome == .confirmedNoCopy {
                 throw error
             }
-            guestOutcomeUnconfirmed = true
+            outcomeGuard.markUnconfirmed()
             throw error
         }
     }

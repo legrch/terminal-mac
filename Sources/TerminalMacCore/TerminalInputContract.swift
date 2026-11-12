@@ -108,7 +108,7 @@ public struct ActionFailureDiagnostic: Encodable {
                        "TERMINAL_LAUNCH_UNAVAILABLE", "TERMINAL_LAUNCH_UNCONFIRMED",
                        "TERMINAL_CAPABILITY_UNSUPPORTED"]
         if let failure = error as? OutcomeFailure {
-            reason = allowed.contains(failure.message) ? failure.message : "UNCLASSIFIED"
+            reason = (allowed.contains(failure.message) || AppServiceContract.reasons.contains(failure.message)) ? failure.message : "UNCLASSIFIED"
             outcome = failure.outcome.rawValue
         } else if error is MailboxTimeout {
             reason = "MAILBOX_TIMEOUT"

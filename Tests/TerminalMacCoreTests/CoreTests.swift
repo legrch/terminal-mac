@@ -6,12 +6,19 @@ import Darwin
 final class CoreTests: XCTestCase {
     func testArtifactShareIsPrivateAndRejectsAliasesAndFiles() throws {
         let manager = FileManager.default
-        let root = manager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        guard let physical = realpath(manager.temporaryDirectory.path, nil) else { throw Failure("Cannot resolve disposable test directory") }
+        defer { free(physical) }
+        let root = URL(fileURLWithPath: String(cString: physical)).appendingPathComponent(UUID().uuidString)
         try manager.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? manager.removeItem(at: root) }
         let share = try ArtifactShareDirectory.prepare(in: root)
         XCTAssertEqual(share.lastPathComponent, "artifacts")
         XCTAssertEqual(try ArtifactShareDirectory.prepare(in: root), share)
+        let probe = share.appendingPathComponent(ArtifactShareDirectory.probeName)
+        XCTAssertEqual(try Data(contentsOf: probe), ArtifactShareDirectory.probeBytes)
+        XCTAssertThrowsError(try AppServiceDirectory.open(share).requireReadOnlyVolume(), "Writable APFS must never qualify as read-only")
+        try Data("tampered".utf8).write(to: probe)
+        XCTAssertThrowsError(try ArtifactShareDirectory.prepare(in: root))
         try manager.removeItem(at: share)
         try manager.createSymbolicLink(at: share, withDestinationURL: root)
         XCTAssertThrowsError(try ArtifactShareDirectory.prepare(in: root))

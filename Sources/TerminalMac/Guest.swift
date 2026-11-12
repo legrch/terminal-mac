@@ -20,6 +20,8 @@ enum GuestGuard {
 @MainActor
 final class GuestRuntime: NSObject {
     let mailbox: Mailbox
+    let exchange: URL
+    lazy var appService = GuestAppService(exchange: exchange, mailbox: mailbox)
     var loop: Task<Void, Never>?
     var window: NSWindow?
     var label: NSTextField?
@@ -35,6 +37,7 @@ final class GuestRuntime: NSObject {
 
     init(exchange: URL) throws {
         try GuestGuard.requireVirtualMac()
+        self.exchange = exchange
         tools = exchange.deletingLastPathComponent().appendingPathComponent("tools")
         mailbox = try Mailbox(exchange)
         super.init()
@@ -81,7 +84,9 @@ final class GuestRuntime: NSObject {
                     // beneath it.
                     // An expired/invalid marker is evidence of possible crashed or unresolved
                     // work, never proof that the host lease ended. Defer until explicit recovery.
-                    if mailbox.helperUpdateDisposition().mayUpdate { GuestBootstrap.updateFromSharedTools(tools) }
+                    if !appService.blocksHelperUpdate && mailbox.helperUpdateDisposition().mayUpdate {
+                        GuestBootstrap.updateFromSharedTools(tools)
+                    }
                 }
                 // Poll quickly while a viewer or agent is active, and gently when idle.
                 try? await Task.sleep(nanoseconds: Date().timeIntervalSince(lastRequest) < 3 ? 3_000_000 : 40_000_000)
@@ -115,6 +120,11 @@ final class GuestRuntime: NSObject {
                 guard wire == request.action else { throw OutcomeFailure("TERMINAL_GUARD_INVALID", outcome: .noEffect) }
             }
             switch request.action {
+            case "app-service":
+                values = try await appService.handle(request)
+                // A response-slot failure after a committed service operation
+                // cannot be reported as noEffect. Its private receipt remains.
+                effects.begin()
             case "terminal-open":
                 guard request.arguments.isEmpty else { throw OutcomeFailure("TERMINAL_GUARD_INVALID", outcome: .noEffect) }
                 try requireAccessibility()
@@ -150,11 +160,16 @@ final class GuestRuntime: NSObject {
                 values = ["screenRecording": String(CGPreflightScreenCaptureAccess()), "accessibility": String(AXIsProcessTrusted()),
                           "width": String(Int(bounds.width)), "height": String(Int(bounds.height)),
                           "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.0",
+                          "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
                           "terminalFocusContract": TerminalInputContract.version,
                           "terminalLaunchContract": TerminalInputContract.launchVersion,
                           "terminalForeground": String(terminal.foreground), "terminalInput": String(terminal.input),
                           "terminalPID": terminal.pid.map { String($0) } ?? "", "terminalWindow": terminal.window ?? "",
-                          "shellReadiness": "not-proven"]
+                          "shellReadiness": "not-proven",
+                          "appServiceContract": AppServiceContract.version,
+                          "appServiceExecutor": "compiled-native-helper",
+                          "appServiceLaunchIdentityContract": AppLaunchIdentity.contract,
+                          "appServiceAdmission": appService.blocksHelperUpdate ? "active-or-unresolved" : "available"]
             case "screenshot" where request.arguments["format"] == "bgra-lz4":
                 guard CGPreflightScreenCaptureAccess() else { throw Failure("Allow Screen Recording for TerminalMacGuest inside the VM, then reopen the helper if macOS requests it") }
                 try await desktop.prepare(maxWidth: number(request, "maxWidth", range: 16...7680), maxHeight: number(request, "maxHeight", range: 16...4320))
