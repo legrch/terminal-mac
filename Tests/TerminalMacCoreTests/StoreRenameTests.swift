@@ -7,7 +7,7 @@ import XCTest
 // recoverable, and running machines, held leases and collisions refuse safely.
 final class StoreRenameTests: XCTestCase {
     private func store() throws -> (Store, URL) {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("rename-tests-" + UUID().uuidString)
+        let root = testTemporaryDirectory.appendingPathComponent("rename-tests-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         return (Store(root: root), root)

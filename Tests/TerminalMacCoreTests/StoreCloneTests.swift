@@ -7,7 +7,7 @@ import XCTest
 // a provenance receipt, and fail-closed refusals that never leave a partial destination behind.
 final class StoreCloneTests: XCTestCase {
     private func store() throws -> (Store, URL) {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("clone-tests-" + UUID().uuidString)
+        let root = testTemporaryDirectory.appendingPathComponent("clone-tests-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         return (Store(root: root), root)

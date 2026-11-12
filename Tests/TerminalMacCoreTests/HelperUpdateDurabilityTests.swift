@@ -6,7 +6,7 @@ import XCTest
 final class HelperUpdateDurabilityTests: XCTestCase {
     func testFileAndDirectorySyncFailuresPreventDispatchAndRetainHostCustody() throws {
         for failedSync in [1, 2] {
-            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let root = testTemporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: root) }
             let lease = try InputLease.acquire(directory: root, owner: "cli:test", generation: 1)
@@ -30,7 +30,7 @@ final class HelperUpdateDurabilityTests: XCTestCase {
     }
 
     func testSuccessfulPublicationSyncsFileThenDirectory() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = testTemporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         var kinds: [mode_t] = []

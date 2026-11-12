@@ -5,7 +5,7 @@ import Foundation
 
 final class AppServicePublicationTests: XCTestCase {
     func testAtomicPublicationNeverOverwritesInstalledApplication() throws {
-        let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+        let root = testTemporaryDirectory
             .appendingPathComponent("native-publication-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -22,7 +22,7 @@ final class AppServicePublicationTests: XCTestCase {
         XCTAssertThrowsError(try stage.child("Fixture.app"))
     }
     func testEvidenceRootParentSyncFailurePreventsLifecycleDispatch() throws {
-        let parent = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent(UUID().uuidString)
+        let parent = testTemporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: parent) }
         let root = parent.appendingPathComponent("service")

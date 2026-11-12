@@ -8,7 +8,7 @@ import XCTest
 // recreate a named file, and a late helper must be refused instead of silently dropped.
 final class MailboxRetentionRegressionTests: XCTestCase {
     private func mailboxPair() throws -> (Mailbox, Mailbox, URL) {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("mailbox-retention-" + UUID().uuidString)
+        let root = testTemporaryDirectory.appendingPathComponent("mailbox-retention-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         return (try Mailbox(root), try Mailbox(root), root)
@@ -229,7 +229,7 @@ final class MailboxRetentionRegressionTests: XCTestCase {
     }
 
     func testStaleResidueIsSweptWhileLiveSlotsSurvive() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("mailbox-sweep-" + UUID().uuidString)
+        let root = testTemporaryDirectory.appendingPathComponent("mailbox-sweep-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         let server = try Mailbox(root)

@@ -8,7 +8,7 @@ final class HelperUpdateCustodyTests: XCTestCase {
     private let start = Date(timeIntervalSince1970: 1000)
 
     private func box() throws -> (Mailbox, URL) {
-        let directory = FileManager.default.temporaryDirectory
+        let directory = testTemporaryDirectory
             .appendingPathComponent("helper-update-custody-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }

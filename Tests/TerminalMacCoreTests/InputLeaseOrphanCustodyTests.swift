@@ -7,7 +7,7 @@ import XCTest
 /// Every fixture is disposable, synthetic, and has no virtual machine or live helper.
 final class InputLeaseOrphanCustodyTests: XCTestCase {
     private func temporary() throws -> URL {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("orphan-custody-" + UUID().uuidString)
+        let url = testTemporaryDirectory.appendingPathComponent("orphan-custody-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: url) }
         return url

@@ -25,7 +25,7 @@ final class AppServiceTests: XCTestCase {
         return record
     }
     func temporary(_ body: (URL) throws -> Void) throws {
-        guard let physical = realpath(FileManager.default.temporaryDirectory.path, nil) else {
+        guard let physical = realpath(testTemporaryDirectory.path, nil) else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
         }
         defer { free(physical) }

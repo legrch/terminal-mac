@@ -7,7 +7,7 @@ import Darwin
 /// Only a validated regular lock and successful nonblocking flock prove FREE.
 final class InputLeaseProbeSafetyTests: XCTestCase {
     private func temporary() throws -> URL {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("lease-probe-" + UUID().uuidString)
+        let directory = testTemporaryDirectory.appendingPathComponent("lease-probe-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
         return directory

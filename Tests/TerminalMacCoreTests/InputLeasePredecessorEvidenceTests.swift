@@ -7,7 +7,7 @@ import XCTest
 /// its own metadata. All files here are disposable synthetic files; no guest/host runtime.
 final class InputLeasePredecessorEvidenceTests: XCTestCase {
     private func temporary() throws -> URL {
-        let directory = FileManager.default.temporaryDirectory
+        let directory = testTemporaryDirectory
             .appendingPathComponent("lease-predecessor-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }

@@ -4,7 +4,7 @@ import Foundation
 
 final class CodeIdentityTests: XCTestCase {
     func testMatchingIdentityAcceptedAndOtherIdentityRejected() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = testTemporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         func signed(_ name: String, identifier: String) throws -> URL {

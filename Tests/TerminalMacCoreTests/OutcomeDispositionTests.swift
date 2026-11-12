@@ -108,7 +108,7 @@ final class OutcomeDispositionTests: XCTestCase {
     }
 
     func temporary() throws -> URL {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("terminal-mac-outcome-tests-\(UUID().uuidString)")
+        let url = testTemporaryDirectory.appendingPathComponent("terminal-mac-outcome-tests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: url) }
         return url

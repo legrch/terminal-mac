@@ -72,7 +72,7 @@ final class InputLeaseTests: XCTestCase {
     }
 
     func testLeaseFlagPublishExpiryAndClear() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("lease-flag-" + UUID().uuidString)
+        let root = testTemporaryDirectory.appendingPathComponent("lease-flag-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         let mailbox = try Mailbox(root)
@@ -84,7 +84,7 @@ final class InputLeaseTests: XCTestCase {
     }
 
     func testUnreadableOrForeignFlagDoesNotFence() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("lease-flag-bad-" + UUID().uuidString)
+        let root = testTemporaryDirectory.appendingPathComponent("lease-flag-bad-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         let mailbox = try Mailbox(root)
@@ -95,7 +95,7 @@ final class InputLeaseTests: XCTestCase {
     }
 
     func testLeaseFlagIsIgnoredByPickupAndSweep() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("lease-flag-sweep-" + UUID().uuidString)
+        let root = testTemporaryDirectory.appendingPathComponent("lease-flag-sweep-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         let mailbox = try Mailbox(root)
@@ -109,7 +109,7 @@ final class InputLeaseTests: XCTestCase {
     }
 
     func temporary() throws -> URL {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("terminal-mac-lease-tests-\(UUID().uuidString)")
+        let url = testTemporaryDirectory.appendingPathComponent("terminal-mac-lease-tests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: url) }
         return url

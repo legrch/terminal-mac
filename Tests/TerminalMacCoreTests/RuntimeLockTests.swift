@@ -5,7 +5,7 @@ import Darwin
 
 final class RuntimeLockTests: XCTestCase {
     func testMissingAndUnlockedAreStoppedAndHeldIsRunning() throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let dir = testTemporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: dir) }
         XCTAssertFalse(try RuntimeLock.isHeld(in: dir))
@@ -20,7 +20,7 @@ final class RuntimeLockTests: XCTestCase {
     }
 
     func testUninspectableLockIsUnknownRatherThanStopped() throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let dir = testTemporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir.appendingPathComponent("runtime.lock"), withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         XCTAssertThrowsError(try RuntimeLock.isHeld(in: dir))
