@@ -24,10 +24,16 @@ public struct MailboxTimeout: LocalizedError {
 /// still recreate a late reply; compatible peer admission is not yet enforced here.
 public final class Mailbox {
     private let fd: Int32
+    private var sync: (Int32) -> Int32 = { fsync($0) }
     public init(_ url: URL, create: Bool = false) throws {
         if create { try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
         fd = open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { throw Failure("Cannot open mailbox \(url.path): \(String(cString: strerror(errno)))") }
+    }
+    /// Fault injection uses the same descriptor operations as durable production publication.
+    convenience init(_ url: URL, sync: @escaping (Int32) -> Int32) throws {
+        try self.init(url)
+        self.sync = sync
     }
     deinit { close(fd) }
     private func check(_ name: String) throws {
@@ -36,7 +42,7 @@ public final class Mailbox {
     public func write(_ data: Data, named name: String) throws {
         try write(data, named: name, replacing: true)
     }
-    private func write(_ data: Data, named name: String, replacing: Bool) throws {
+    private func write(_ data: Data, named name: String, replacing: Bool, durable: Bool = false) throws {
         try check(name)
         let temporary = ".\(UUID().uuidString).tmp"
         let out = openat(fd, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
@@ -51,11 +57,17 @@ public final class Mailbox {
                 offset += count
             }
         }
+        if durable {
+            guard sync(out) == 0 else { throw Failure("Cannot sync helper-update marker; preserve custody evidence") }
+        }
         let result = replacing ? renameat(fd, temporary, fd, name) :
             renameatx_np(fd, temporary, fd, name, UInt32(RENAME_EXCL))
         guard result == 0 else {
             if !replacing && errno == EEXIST { throw Failure("Stale mailbox request '\(name)' already exists") }
             throw Failure("Cannot publish mailbox file: \(String(cString: strerror(errno)))")
+        }
+        if durable {
+            guard sync(fd) == 0 else { throw Failure("Cannot sync helper-update marker directory; preserve custody evidence") }
         }
     }
     /// Create an empty caller-owned publication slot. Never overwrites existing content.
@@ -163,7 +175,7 @@ public final class Mailbox {
     public func publishLeaseFlag(owner: String, ttl: TimeInterval, now: Date = Date()) throws {
         try write(JSONEncoder().encode(LeaseFlag(schema: Self.leaseFlagSchema, owner: owner,
                                                  deadline: now.addingTimeInterval(ttl).timeIntervalSince1970)),
-                  named: Self.leaseFlagName)
+                  named: Self.leaseFlagName, replacing: true, durable: true)
     }
     /// The original display-only lookup. Never use nil here as permission to replace a helper:
     /// nil includes malformed, expired and unreadable markers as well as true absence.
