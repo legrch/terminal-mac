@@ -7,6 +7,32 @@ import TerminalMacCore
 /// helper processes, and never inspects argv/environment or application data.
 @MainActor
 enum GuestProcessCensus {
+    /// Native reads are injectable so identity races can be tested without
+    /// enumerating, observing or launching any operating-system process.
+    struct Sampling {
+        var requireGuest: () throws -> Void
+        var bsd: (Int32) throws -> proc_bsdinfo?
+        var path: (Int32) throws -> String
+        var pids: () throws -> [Int32]
+        var applications: () throws -> [AppGUIObservation]
+        var uid: UInt32
+    }
+    private static var nativeSampling: Sampling {
+        Sampling(requireGuest: GuestGuard.requireVirtualMac, bsd: bsd, path: path,
+                 pids: pids, applications: applications, uid: geteuid())
+    }
+    private static func applications() throws -> [AppGUIObservation] {
+        let apps = NSWorkspace.shared.runningApplications
+        guard apps.count <= AppLaunchIdentity.maximumApplications else {
+            throw AppLaunchIdentityError.censusUnavailable
+        }
+        return apps.map {
+            AppGUIObservation(pid: $0.processIdentifier, bundlePath: $0.bundleURL?.path ?? "",
+                              bundleID: $0.bundleIdentifier ?? "", executable: $0.executableURL?.path ?? "",
+                              regular: $0.activationPolicy == .regular)
+        }
+    }
+
     static func timeBoundary() throws -> AppProcessKey {
         var time = timeval()
         guard gettimeofday(&time, nil) == 0, time.tv_sec > 0, time.tv_usec >= 0,
@@ -40,24 +66,28 @@ enum GuestProcessCensus {
         return path
     }
 
-    static func process(_ pid: Int32) throws -> AppProcessSnapshot? {
-        try GuestGuard.requireVirtualMac()
+    static func process(_ pid: Int32, sampling injected: Sampling? = nil) throws -> AppProcessSnapshot? {
+        let sampling = injected ?? nativeSampling
+        try sampling.requireGuest()
         guard pid > 0 else { throw AppLaunchIdentityError.censusUnavailable }
-        guard let before = try bsd(pid) else { return nil }
+        guard let before = try sampling.bsd(pid) else { return nil }
         // A process that exits between reads is absent, not changed. Only a
         // live process whose identity differs between reads is censusChanged.
         func pathOrAbsent() throws -> String? {
-            do { return try path(pid) } catch {
-                if (try bsd(pid)) == nil { return nil }
+            do { return try sampling.path(pid) } catch {
+                if (try sampling.bsd(pid)) == nil { return nil }
                 throw error
             }
         }
         guard let executable = try pathOrAbsent() else { return nil }
-        guard let after = try bsd(pid) else { return nil }
+        guard let after = try sampling.bsd(pid) else { return nil }
         guard let again = try pathOrAbsent() else { return nil }
+        // Parent PID is ancestry, not identity (AppLaunchIdentity excludes it):
+        // a parent exiting mid-read reparents the child and must not poison it.
+        // The latest parent is reported; start, UID and executable must hold.
         guard before.pbi_start_tvsec == after.pbi_start_tvsec,
               before.pbi_start_tvusec == after.pbi_start_tvusec,
-              before.pbi_uid == after.pbi_uid, before.pbi_ppid == after.pbi_ppid,
+              before.pbi_uid == after.pbi_uid,
               executable == again else { throw AppLaunchIdentityError.censusChanged }
         return AppProcessSnapshot(
             key: AppProcessKey(pid: pid, startSeconds: after.pbi_start_tvsec,
@@ -99,16 +129,18 @@ enum GuestProcessCensus {
     /// accepted identity in a sample that is later torn still fails at once.
     static func captureForQuit(check: () throws -> Void,
                                observe: (AppProcessSnapshot) throws -> Void = { _ in },
-                               observeApplications: ([AppGUIObservation]) throws -> Void = { _ in }) throws -> AppProcessCensus {
-        try GuestGuard.requireVirtualMac()
+                               observeApplications: ([AppGUIObservation]) throws -> Void = { _ in },
+                               sampling injected: Sampling? = nil) throws -> AppProcessCensus {
+        let sampling = injected ?? nativeSampling
+        try sampling.requireGuest()
         try Task.checkCancellation()
         try check()
-        let before = try pids()
+        let before = try sampling.pids()
         var processes: [AppProcessSnapshot] = []
         for pid in before {
             try Task.checkCancellation()
             try check()
-            guard let process = try GuestProcessCensus.process(pid), process.uid == geteuid() else {
+            guard let process = try GuestProcessCensus.process(pid, sampling: sampling), process.uid == sampling.uid else {
                 throw AppLaunchIdentityError.censusChanged
             }
             try observe(process)
@@ -117,17 +149,9 @@ enum GuestProcessCensus {
         // Do not filter by PID membership, isTerminated or activationPolicy:
         // each accepted-tree registry entry must disappear observably. Unknown
         // registry metadata is handled fail-closed by the frozen Core policy.
-        let apps = NSWorkspace.shared.runningApplications
-        guard apps.count <= AppLaunchIdentity.maximumApplications else {
-            throw AppLaunchIdentityError.censusUnavailable
-        }
-        let applications = apps.map {
-            AppGUIObservation(pid: $0.processIdentifier, bundlePath: $0.bundleURL?.path ?? "",
-                              bundleID: $0.bundleIdentifier ?? "", executable: $0.executableURL?.path ?? "",
-                              regular: $0.activationPolicy == .regular)
-        }
+        let applications = try sampling.applications()
         try observeApplications(applications)
-        guard before == (try pids()) else { throw AppLaunchIdentityError.censusChanged }
+        guard before == (try sampling.pids()) else { throw AppLaunchIdentityError.censusChanged }
         try Task.checkCancellation()
         try check()
         return AppProcessCensus(processes: processes, applications: applications, complete: true)
@@ -165,6 +189,8 @@ enum GuestProcessCensus {
 final class GuestOriginalProcessObserver {
     let expected: AppProcessSnapshot
     private let queue: Int32
+    private let sample: () throws -> AppProcessSnapshot?
+    private let originalExit: () throws -> Bool
     private var exited = false
     private var invalid = false
 
@@ -194,27 +220,44 @@ final class GuestOriginalProcessObserver {
         }
         // Transfer only on successful initialization; no double-close on a
         // throwing initializer or risk of closing a newly reused descriptor.
-        expected = process; queue = acquired; transferred = true
+        expected = process; queue = acquired
+        sample = { try GuestProcessCensus.process(process.key.pid) }
+        originalExit = { try Self.pollExit(queue: acquired, pid: process.key.pid) }
+        transferred = true
     }
-    deinit { close(queue) }
+    /// Test seam for the same life() path, without allocating a kernel observer.
+    init(_ process: AppProcessSnapshot, sample: @escaping () throws -> AppProcessSnapshot?,
+         originalExit: @escaping () throws -> Bool) {
+        expected = process; queue = -1; self.sample = sample; self.originalExit = originalExit
+    }
+    deinit { if queue >= 0 { close(queue) } }
 
-    func life() -> AppProcessLife {
-        if invalid { return .unknown }
-        if exited { return .exited }
+    private static func pollExit(queue: Int32, pid: Int32) throws -> Bool {
         var event = kevent()
         var timeout = timespec(tv_sec: 0, tv_nsec: 0)
         let count = tp_kevent(queue, nil, 0, &event, 1, &timeout)
         if count == 1 {
-            guard event.ident == UInt(expected.key.pid), event.filter == Int16(EVFILT_PROC),
+            guard event.ident == UInt(pid), event.filter == Int16(EVFILT_PROC),
                   event.flags & UInt16(EV_ERROR) == 0, event.fflags & UInt32(NOTE_EXIT) != 0 else {
-                invalid = true; return .unknown
+                throw AppLaunchIdentityError.observationUnavailable
             }
-            exited = true
-            return AppLaunchIdentity.life(of: expected, observation: .originalExit(expected.key))
+            return true
         }
-        guard count == 0 else { invalid = true; return .unknown }
+        guard count == 0 else { throw AppLaunchIdentityError.observationUnavailable }
+        return false
+    }
+
+    func life() -> AppProcessLife {
+        if invalid { return .unknown }
+        if exited { return .exited }
         do {
-            let actual = try GuestProcessCensus.process(expected.key.pid)
+            if try originalExit() {
+                exited = true
+                return AppLaunchIdentity.life(of: expected, observation: .originalExit(expected.key))
+            }
+        } catch { invalid = true; return .unknown }
+        do {
+            let actual = try sample()
             let life = AppLaunchIdentity.life(of: expected,
                 observation: actual.map(AppProcessObservation.live) ?? .absent)
             // A changed live identity poisons this ownership. A missing sample
