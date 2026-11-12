@@ -14,7 +14,7 @@ final class AgentServer {
     let name: String
     /// Sticky for this session. A crash also leaves the original marker behind.
     private var outcomeGuard = GuestSessionOutcomeGuard()
-    private let sessionOwner = "mcp:" + UUID().uuidString.lowercased()
+    let sessionOwner = "mcp:" + UUID().uuidString.lowercased()
     private var guestActionInFlight = false
     private let appSelection: AppMCPSelection?
     private var appSession: AppServiceMCPSession?
@@ -223,17 +223,24 @@ final class AgentServer {
     }
 
     private func exchange() throws -> Mailbox { try Mailbox(store.directory(name).appendingPathComponent("exchange")) }
-    private func guest(_ request: Request, mailbox: Mailbox? = nil) async throws -> Reply {
-        try outcomeGuard.requireAllowed(action: request.action)
+    func guest(_ request: Request, mailbox: Mailbox? = nil) async throws -> Reply {
+        let observation = ["status", "screenshot"].contains(request.action) ||
+            (request.action == "app-service" && request.arguments["serviceCommand"] == "observe")
+        if !observation { try outcomeGuard.requireAllowed(action: request.action) }
         try requireRunning()
         let box: Mailbox
         if let mailbox { box = mailbox } else { box = try exchange() }
-        // The session marker is already published. A timeout or unclassified
-        // failure keeps it after the MCP lease releases; no implicit retry/clear.
+        // Every mutation, including app-service bootstrap and EOF Quit/close,
+        // borrows through the same durable fence as cooperative CLI calls.
+        // Admission errors issue no request and do not reclassify any outcome.
+        let custody = observation ? nil : try GuestInputCustody.begin(
+            directory: store.directory(name), mailbox: box, request: request, claimedOwner: sessionOwner)
         guestActionInFlight = true
         defer { guestActionInFlight = false }
-        do { return try await box.call(request) }
-        catch {
+        do {
+            if let custody { return try await custody.perform { try await box.call(request) } }
+            return try await box.call(request)
+        } catch {
             if let failure = error as? OutcomeFailure,
                failure.outcome == .noEffect || failure.outcome == .confirmedNoCopy {
                 throw error
