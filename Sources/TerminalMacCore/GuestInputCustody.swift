@@ -17,6 +17,13 @@ public final class GuestInputCustody {
     }
     static func begin(directory: URL, mailbox: Mailbox, request: Request,
                       claimedOwner: String?, afterProbe: () throws -> Void) throws -> GuestInputCustody {
+        try InputLease.withAdmission(directory: directory) {
+            try beginUnderAdmission(directory: directory, mailbox: mailbox, request: request,
+                                    claimedOwner: claimedOwner, afterProbe: afterProbe)
+        }
+    }
+    private static func beginUnderAdmission(directory: URL, mailbox: Mailbox, request: Request,
+                                            claimedOwner: String?, afterProbe: () throws -> Void) throws -> GuestInputCustody {
         try request.requireLive()
         let state = try InputLease.probe(directory: directory)
         try afterProbe()
@@ -38,6 +45,14 @@ public final class GuestInputCustody {
         case .unresolved: throw Failure("Previous guest input operation is unresolved; reconcile retained custody evidence")
         }
         do {
+            if lease == nil {
+                // Marker absence means holder teardown has already started.
+                // Borrowers never recreate its inhibitor or reopen admission.
+                switch mailbox.helperUpdateDisposition() {
+                case .active(let current) where current == owner, .stale(let current) where current == owner: break
+                default: throw Failure("Cooperative holder has no active helper-update custody")
+                }
+            }
             let custody = try GuestInputCustody(directory: directory, mailbox: mailbox,
                 request: request, owner: owner, generation: generation, lease: lease)
             if lease == nil {
@@ -45,8 +60,8 @@ public final class GuestInputCustody {
                     throw Failure("The cooperative input holder changed before dispatch; preserve operation evidence")
                 }
             }
-            // A borrowed holder keeps its own inhibitor; an absent one is published
-            // before effects and left for that holder to release.
+            // Admission and teardown use one lock. Borrowers require the
+            // holder's existing marker; only acquired custody publishes one.
             switch mailbox.helperUpdateDisposition() {
             case .unmarked: try mailbox.publishLeaseFlag(owner: owner, ttl: 120)
             case .active(let current) where current == owner, .stale(let current) where current == owner: break

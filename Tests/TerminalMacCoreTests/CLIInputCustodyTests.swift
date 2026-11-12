@@ -66,6 +66,7 @@ final class CLIInputCustodyTests: XCTestCase {
         let (_, directory, box) = try fixture()
         let holder = try InputLease.acquire(directory: directory, owner: "scenario", generation: 1)
         defer { holder.release(preserveMetadata: true) }
+        try box.publishLeaseFlag(owner: holder.owner, ttl: 120)
         let request = Request(action: "clipboard-paste", timeout: 0.01)
         let custody = try GuestInputCustody.begin(directory: directory, mailbox: box, request: request, claimedOwner: holder.owner)
         do { _ = try await custody.perform { try await box.call(request) }; XCTFail("No helper") } catch {}
@@ -76,10 +77,45 @@ final class CLIInputCustodyTests: XCTestCase {
     func testBorrowedOwnerReleaseBetweenProbeAndFencePreventsDispatch() throws {
         let (_, directory, box) = try fixture()
         let holder = try InputLease.acquire(directory: directory, owner: "scenario", generation: 1)
+        try box.publishLeaseFlag(owner: holder.owner, ttl: 120)
         XCTAssertThrowsError(try GuestInputCustody.begin(directory: directory, mailbox: box,
             request: Request(action: "type"), claimedOwner: holder.owner, afterProbe: { holder.release() }))
         XCTAssertTrue(try box.requests().isEmpty)
         XCTAssertTrue(try InputLease.hasOperationFence(directory))
+    }
+
+    func testMarkerTeardownSerializesBorrowerAdmissionAfterAbsenceCheck() throws {
+        let (_, directory, box) = try fixture()
+        let holder = try InputLease.acquire(directory: directory, owner: "scenario", generation: 1)
+        defer { holder.release() }
+        try box.publishLeaseFlag(owner: holder.owner, ttl: 120)
+        try box.releaseLeaseFlag(ownedBy: holder.owner, now: Date(), afterFenceCheck: {
+            // A second open of the flock represents an independent client.
+            XCTAssertThrowsError(try GuestInputCustody.begin(directory: directory, mailbox: box,
+                request: Request(action: "key"), claimedOwner: holder.owner))
+            XCTAssertFalse(try InputLease.hasOperationFence(directory))
+        })
+        XCTAssertEqual(box.helperUpdateDisposition(), .unmarked)
+        // Teardown cannot be reopened between marker removal and lease release.
+        XCTAssertThrowsError(try GuestInputCustody.begin(directory: directory, mailbox: box,
+            request: Request(action: "key"), claimedOwner: holder.owner))
+        XCTAssertFalse(try InputLease.hasOperationFence(directory))
+        XCTAssertTrue(try box.requests().isEmpty)
+    }
+    func testBorrowerAdmissionPreventsConcurrentMarkerTeardown() async throws {
+        let (_, directory, box) = try fixture()
+        let holder = try InputLease.acquire(directory: directory, owner: "scenario", generation: 1)
+        defer { holder.release() }
+        try box.publishLeaseFlag(owner: holder.owner, ttl: 120)
+        let operation = try GuestInputCustody.begin(directory: directory, mailbox: box,
+            request: Request(action: "key"), claimedOwner: holder.owner, afterProbe: {
+                XCTAssertThrowsError(try box.releaseLeaseFlag(ownedBy: holder.owner))
+            })
+        try await operation.perform {
+            XCTAssertFalse(box.helperUpdateDisposition().mayUpdate)
+            XCTAssertThrowsError(try box.releaseLeaseFlag(ownedBy: holder.owner))
+        }
+        try box.releaseLeaseFlag(ownedBy: holder.owner)
     }
 
 }

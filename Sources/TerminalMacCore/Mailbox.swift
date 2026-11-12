@@ -217,6 +217,16 @@ public final class Mailbox {
     /// A clean holder may clear only its own well-formed marker, including an expired
     /// one. Missing, corrupt or foreign entries remain unchanged for reconciliation.
     public func releaseLeaseFlag(ownedBy owner: String, now: Date = Date()) throws {
+        try releaseLeaseFlag(ownedBy: owner, now: now, afterFenceCheck: {})
+    }
+    /// The hook deterministically exercises a borrower arriving during teardown.
+    func releaseLeaseFlag(ownedBy owner: String, now: Date, afterFenceCheck: () throws -> Void) throws {
+        try InputLease.withAdmission(directoryFD: fd, name: "../input-admission.lock") {
+            try releaseLeaseFlagUnderAdmission(ownedBy: owner, now: now, afterFenceCheck: afterFenceCheck)
+        }
+    }
+    func releaseLeaseFlagUnderAdmission(ownedBy owner: String, now: Date = Date(),
+                                       afterFenceCheck: () throws -> Void = {}) throws {
         // Host holders must not drop their inhibitor while a borrowed operation
         // still owns its durable dispatch fence in the machine directory.
         var operation = stat()
@@ -224,6 +234,7 @@ public final class Mailbox {
         guard found != 0 && errno == ENOENT else {
             throw Failure("Guest operation fence remains unresolved; preserve helper-update custody")
         }
+        try afterFenceCheck()
         switch helperUpdateDisposition(now: now) {
         case .active(let current) where current == owner,
              .stale(let current) where current == owner:

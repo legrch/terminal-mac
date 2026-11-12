@@ -121,8 +121,13 @@ public final class InputLease {
         released = true
         // A borrowed native/CLI operation may still be in flight after its
         // original holder exits. Its durable fence owns both custody records.
-        if !preserveMetadata && (try? Self.hasOperationFence(relocatedDirectory ?? directory)) == false {
-            Self.removeOwnedMetadata(directory: relocatedDirectory ?? directory, receipt: metadataReceipt)
+        if !preserveMetadata {
+            let location = relocatedDirectory ?? directory
+            try? Self.withAdmission(directory: location) {
+                if try !Self.hasOperationFence(location) {
+                    Self.removeOwnedMetadata(directory: location, receipt: metadataReceipt)
+                }
+            }
         }
         _ = flock(fd, LOCK_UN)
         close(fd)
@@ -141,6 +146,28 @@ public final class InputLease {
         case held(owner: String, generation: Int)
         case heldUnknown
         case unresolved
+    }
+
+    /// Short cross-process admission barrier shared by operation publication,
+    /// marker teardown and metadata release. Never wait behind another client.
+    static func withAdmission<T>(directory: URL, _ body: () throws -> T) throws -> T {
+        let fd = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw Failure("Cannot open input admission directory") }
+        defer { close(fd) }
+        return try withAdmission(directoryFD: fd, name: "input-admission.lock", body)
+    }
+    static func withAdmission<T>(directoryFD: Int32, name: String, _ body: () throws -> T) throws -> T {
+        let lock = openat(directoryFD, name, O_CREAT | O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0o600)
+        guard lock >= 0 else { throw Failure("Cannot open input admission lock") }
+        defer { close(lock) }
+        var info = stat()
+        guard fstat(lock, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_nlink == 1, info.st_uid == geteuid(), info.st_mode & 0o077 == 0 else {
+            throw Failure("Unsafe input admission lock")
+        }
+        guard flock(lock, LOCK_EX | LOCK_NB) == 0 else { throw Failure("Guest input custody is changing; dispatch refused") }
+        defer { _ = flock(lock, LOCK_UN) }
+        return try body()
     }
 
     private static func isContention(_ code: Int32) -> Bool {
