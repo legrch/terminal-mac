@@ -318,7 +318,14 @@ final class GuestApplicationLifecycle {
         // Rebinding is only a comparison with the original root/primary; it
         // creates no observer, process authority or new lifecycle. Accepted
         // processes first seen after this boundary cannot be adopted as ours.
-        let beforeQuit = try GuestProcessCensus.captureForQuit(check: check)
+        // No termination has been requested yet. Establish one complete
+        // pre-effect snapshot with the same bounded torn-read sampling used
+        // at launch. Every sample retains the original request checks; no
+        // partial census is accepted and no application effect is repeated.
+        // Post-terminate drain/close observations remain strict single reads.
+        let beforeQuit = try AppLaunchIdentity.stableCensus {
+            try GuestProcessCensus.captureForQuit(check: check)
+        }
         let confirmed = try AppLaunchIdentity.bind(plan: plan, before: before,
             after: beforeQuit, returned: returnedProcess.key, notBefore: notBefore, uid: geteuid())
         try AppLaunchIdentity.requireSameBinding(binding, confirmed)

@@ -153,3 +153,15 @@ integrated helper15 package builds. The original UNKNOWN remains unchanged.
 Fresh guest qualification of helper15 is a separate pending gate. No force
 application termination, PID-name acquisition or historical fence cleanup was
 introduced. Arbitrary detached-descendant cleanup remains unverified.
+
+### Pre-effect Quit census qualification (November 12, 2026)
+
+Helper15 in fresh `farol-qa-14` inherited both grants and automatic login.
+Install, launch, first normal Quit, relaunch and one-window observation passed.
+The second Quit failed before terminate (`normalQuitRequested=false`,
+`PROCESS_CENSUS_CHANGED`); its original UNKNOWN and disk/fence remain retained.
+The pre-terminate census now uses the existing eight-attempt full torn-read
+sampler, with original custody/deadline checks in every attempt. No partial
+snapshot is accepted and no application effect is repeated. Post-terminate
+drain and close still fail immediately on an unreadable/torn sample. All 217
+XCTest cases pass; helper16 live qualification remains pending.
