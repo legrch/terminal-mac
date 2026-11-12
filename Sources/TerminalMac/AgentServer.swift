@@ -55,6 +55,9 @@ final class AgentServer {
     ]
 
     func run() async throws {
+        // InputLease.acquire creates its directories. Validate the selected machine
+        // first so an early MCP launch cannot obstruct normal first-use creation.
+        _ = try store.load(name)
         // The MCP agent owns guest input while it serves; a competing viewer or scenario is
         // refused at startup instead of interleaving guest actions.
         let lease = try InputLease.acquire(directory: try store.directory(name), owner: sessionOwner,
@@ -239,7 +242,7 @@ final class AgentServer {
             throw error
         }
     }
-    /// Checked per call, so the server starts (and lists its tools) before any VM exists.
+    /// Running state is checked per call; existence is validated before acquiring custody.
     private func requireRunning() throws {
         guard (try? store.load(name)) != nil else {
             throw Failure("No virtual Mac named '\(name)' exists yet. Ask the user to run `terminal-mac up\(name == "default" ? "" : " " + name)`; it downloads macOS and needs them for first-time setup.")
