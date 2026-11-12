@@ -108,7 +108,10 @@ public final class Mailbox {
     }
     public func read(_ name: String, limit: Int = 1_048_576) throws -> Data? {
         try check(name)
-        let input = openat(fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        return try readEntry(name, limit: limit, directoryFD: fd)
+    }
+    private func readEntry(_ name: String, limit: Int, directoryFD: Int32) throws -> Data? {
+        let input = openat(directoryFD, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         if input < 0 && errno == ENOENT { return nil }
         guard input >= 0 else { throw Failure("Cannot read mailbox file (symlinks are rejected)") }
         defer { close(input) }
@@ -222,7 +225,25 @@ public final class Mailbox {
     /// The hook deterministically exercises a borrower arriving during teardown.
     func releaseLeaseFlag(ownedBy owner: String, now: Date, wait: Bool = true, afterFenceCheck: () throws -> Void) throws {
         try InputLease.withAdmission(directoryFD: fd, name: "../input-admission.lock", wait: wait) {
+            let machine = openat(fd, "..", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            guard machine >= 0 else { throw Failure("Cannot open input closing directory") }
+            defer { close(machine) }
+            let closing = try readEntry(InputLease.closingName, limit: 4096, directoryFD: machine)
+            if let closing {
+                let record = try JSONSerialization.jsonObject(with: closing) as? [String: String]
+                guard record == ["schema": "terminal-mac.input-closing/1", "owner": owner] else {
+                    throw Failure("Input closing owner changed; preserve custody")
+                }
+            }
             try releaseLeaseFlagUnderAdmission(ownedBy: owner, now: now, afterFenceCheck: afterFenceCheck)
+            // Only this acknowledged teardown discharges closing intent. A
+            // missing marker or failed removal sync must retain that fence.
+            // The holder still releases its exact metadata receipt separately.
+            if closing != nil {
+                guard unlinkat(machine, InputLease.closingName, 0) == 0, sync(machine) == 0 else {
+                    throw Failure("Cannot durably release input closing intent")
+                }
+            }
         }
     }
     func releaseLeaseFlagUnderAdmission(ownedBy owner: String, now: Date = Date(),
@@ -254,7 +275,7 @@ public final class Mailbox {
             }
             // A failed directory sync leaves removal durability UNKNOWN. The host holder
             // must retain its machine metadata rather than claiming clean completion.
-            guard fsync(fd) == 0 else {
+            guard sync(fd) == 0 else {
                 throw Failure("Cannot sync helper-update marker removal; preserve custody evidence")
             }
         default:

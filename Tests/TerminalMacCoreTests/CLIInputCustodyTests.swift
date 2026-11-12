@@ -117,6 +117,12 @@ final class CLIInputCustodyTests: XCTestCase {
             XCTAssertThrowsError(try box.releaseLeaseFlag(ownedBy: holder.owner))
         }
         try box.releaseLeaseFlag(ownedBy: holder.owner)
+        holder.release()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent(InputLease.metadataName).path))
+        XCTAssertFalse(try InputLease.hasClosingFence(directory))
+        XCTAssertEqual(try InputLease.probe(directory: directory), .free)
+        let next = try InputLease.acquire(directory: directory, owner: "next", generation: 2)
+        next.release()
     }
 
     func testHolderExitThenConfirmedBorrowedSuccessReleasesExactOrphanCustody() async throws {
@@ -194,6 +200,48 @@ final class CLIInputCustodyTests: XCTestCase {
         holder.release(preserveMetadata: true)
         XCTAssertEqual(box.helperUpdateDisposition(), .unmarked)
         XCTAssertEqual(try InputLease.probe(directory: directory), .free)
+    }
+
+    func testUnconfirmedMarkerRemovalCannotDischargeClosingIntent() async throws {
+        for missingMarker in [true, false] {
+            let (_, directory, box) = try fixture()
+            let holder = try InputLease.acquire(directory: directory, owner: "scenario", generation: 1)
+            try box.publishLeaseFlag(owner: holder.owner, ttl: 120)
+            let operation = try GuestInputCustody.begin(directory: directory, mailbox: box,
+                request: Request(action: "key"), claimedOwner: holder.owner)
+            try await operation.perform {
+                XCTAssertThrowsError(try box.releaseLeaseFlag(ownedBy: holder.owner))
+            }
+            if missingMarker { box.clearLeaseFlag() }
+            let failingBox = try Mailbox(directory.appendingPathComponent("exchange"), sync: { _ in
+                errno = EIO; return -1
+            })
+            XCTAssertThrowsError(try failingBox.releaseLeaseFlag(ownedBy: holder.owner))
+            holder.release(preserveMetadata: true)
+            XCTAssertTrue(try InputLease.hasClosingFence(directory))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent(InputLease.metadataName).path))
+            XCTAssertEqual(try InputLease.probe(directory: directory), .unresolved)
+            XCTAssertThrowsError(try InputLease.acquire(directory: directory, owner: "next", generation: 2))
+        }
+    }
+
+    func testAcknowledgedMarkerTeardownDoesNotReleaseSubstitutedMetadata() async throws {
+        let (_, directory, box) = try fixture()
+        let holder = try InputLease.acquire(directory: directory, owner: "scenario", generation: 1)
+        try box.publishLeaseFlag(owner: holder.owner, ttl: 120)
+        let operation = try GuestInputCustody.begin(directory: directory, mailbox: box,
+            request: Request(action: "key"), claimedOwner: holder.owner)
+        try await operation.perform {
+            XCTAssertThrowsError(try box.releaseLeaseFlag(ownedBy: holder.owner))
+        }
+        let metadata = directory.appendingPathComponent(InputLease.metadataName)
+        let bytes = try Data(contentsOf: metadata)
+        try bytes.write(to: metadata, options: .atomic)
+        try box.releaseLeaseFlag(ownedBy: holder.owner)
+        holder.release()
+        XCTAssertEqual(try Data(contentsOf: metadata), bytes)
+        XCTAssertEqual(try InputLease.probe(directory: directory), .unresolved)
+        XCTAssertThrowsError(try InputLease.acquire(directory: directory, owner: "next", generation: 2))
     }
     func testConfirmedBorrowerCannotReconcileSubstitutedCustodyRecord() async throws {
         let (_, directory, box) = try fixture()
