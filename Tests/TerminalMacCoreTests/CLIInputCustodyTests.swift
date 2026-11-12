@@ -73,4 +73,13 @@ final class CLIInputCustodyTests: XCTestCase {
         XCTAssertThrowsError(try GuestInputCustody.begin(directory: directory, mailbox: box,
             request: Request(action: "key"), claimedOwner: holder.owner))
     }
+    func testBorrowedOwnerReleaseBetweenProbeAndFencePreventsDispatch() throws {
+        let (_, directory, box) = try fixture()
+        let holder = try InputLease.acquire(directory: directory, owner: "scenario", generation: 1)
+        XCTAssertThrowsError(try GuestInputCustody.begin(directory: directory, mailbox: box,
+            request: Request(action: "type"), claimedOwner: holder.owner, afterProbe: { holder.release() }))
+        XCTAssertTrue(try box.requests().isEmpty)
+        XCTAssertTrue(try InputLease.hasOperationFence(directory))
+    }
+
 }

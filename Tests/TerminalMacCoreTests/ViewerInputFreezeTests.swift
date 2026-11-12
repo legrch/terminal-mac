@@ -20,6 +20,9 @@ final class ViewerInputFreezeTests: XCTestCase {
             try await Task.sleep(nanoseconds: 2_000_000)
         }
         XCTAssertTrue(viewer.guestOutcomeUnconfirmed)
+        XCTAssertEqual(try InputLease.probe(directory: directory), .unresolved)
+        XCTAssertFalse(box.helperUpdateDisposition().mayUpdate)
+        XCTAssertNotNil(InputLease.nativeWindowDenial(probe: try InputLease.probe(directory: directory), windowOwner: TerminalViewer.leaseOwner))
         viewer.enqueue("type", ["text": "later input"], label: "New text")
         viewer.enqueue(Request(action: "key", arguments: ["key": "cmd+v"]), label: "Repeated paste")
         viewer.sendNextInput()

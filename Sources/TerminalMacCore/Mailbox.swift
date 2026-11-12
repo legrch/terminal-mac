@@ -217,6 +217,13 @@ public final class Mailbox {
     /// A clean holder may clear only its own well-formed marker, including an expired
     /// one. Missing, corrupt or foreign entries remain unchanged for reconciliation.
     public func releaseLeaseFlag(ownedBy owner: String, now: Date = Date()) throws {
+        // Host holders must not drop their inhibitor while a borrowed operation
+        // still owns its durable dispatch fence in the machine directory.
+        var operation = stat()
+        let found = fstatat(fd, "../" + InputLease.operationName, &operation, AT_SYMLINK_NOFOLLOW)
+        guard found != 0 && errno == ENOENT else {
+            throw Failure("Guest operation fence remains unresolved; preserve helper-update custody")
+        }
         switch helperUpdateDisposition(now: now) {
         case .active(let current) where current == owner,
              .stale(let current) where current == owner:

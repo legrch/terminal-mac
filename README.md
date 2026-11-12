@@ -153,8 +153,11 @@ actions. `terminal-mac lease NAME status` also reports `state: unresolved-predec
 `held: false` response alone does not authorize input: consumers must inspect the state.
 Retained or unreadable evidence must be reconciled, not removed automatically. The updated
 guest helper defers self-replacement while a marker exists, even after expiry. These checks
-do not authenticate the owner token or make a probe and action atomic; older installed
-helpers and clients require separate compatibility verification.
+do not authenticate the owner token. Standalone mutations acquire custody through dispatch;
+cooperative owner calls also publish a durable `input-operation.json` fence before effects.
+Unknown results retain that fence and both custody records for explicit reconciliation,
+including when the original holder exits. Older installed helpers and clients require
+separate compatibility verification.
 
 The agent instructions are in [docs/AGENT.md](docs/AGENT.md). No global agent settings are modified.
 

@@ -40,6 +40,11 @@ public final class GuestInputCustody {
         do {
             let custody = try GuestInputCustody(directory: directory, mailbox: mailbox,
                 request: request, owner: owner, generation: generation, lease: lease)
+            if lease == nil {
+                guard try InputLease.borrowedHolderMatches(directory: directory, owner: owner, generation: generation) else {
+                    throw Failure("The cooperative input holder changed before dispatch; preserve operation evidence")
+                }
+            }
             // A borrowed holder keeps its own inhibitor; an absent one is published
             // before effects and left for that holder to release.
             switch mailbox.helperUpdateDisposition() {

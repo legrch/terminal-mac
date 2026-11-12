@@ -145,8 +145,7 @@ final class TerminalViewer {
         try mailbox.requireNoOutstandingUpdateMarker()
         try mailbox.publishLeaseFlag(owner: Self.leaseOwner, ttl: 120)
         markerPublished = true
-        var lastFlagPublish = Date()
-        func refreshLeaseFlag() { if Date().timeIntervalSince(lastFlagPublish) >= 30 { lastFlagPublish = Date(); try? mailbox.publishLeaseFlag(owner: Self.leaseOwner, ttl: 120) } }
+        // Expiry remains an update inhibitor, so no uncertain publication is renewed.
         var parser = TerminalInput(), lastInput = Date(), previousSize = "", lastChrome = Date.distantPast
         let started = Date()
         while !quit {
@@ -178,7 +177,6 @@ final class TerminalViewer {
             if transportDecided, frames == nil, metrics.cellHeight != nil || Date().timeIntervalSince(started) > 0.4 { frames = streamFrames() }
             if wheel.dx != 0 || wheel.dy != 0, Date().timeIntervalSince(wheel.at) >= 0.03 { flushWheel() }
             sendNextInput()
-            refreshLeaseFlag()
             if Date().timeIntervalSince(lastChrome) >= 0.08 { lastChrome = Date(); drawChrome() }
             try await Task.sleep(nanoseconds: 4_000_000)
         }
@@ -496,13 +494,17 @@ final class TerminalViewer {
             let started = Date()
             do {
                 try request.requireLive()
-                if request.action == "clipboard-copy" {
-                    guard let revision = request.arguments["hostRevision"].flatMap(Int.init) else {
-                        throw OutcomeFailure("Missing clipboard ownership", outcome: .noEffect)
+                let custody = try GuestInputCustody.begin(directory: directory, mailbox: mailbox,
+                    request: request, claimedOwner: Self.leaseOwner)
+                try await custody.perform {
+                    if request.action == "clipboard-copy" {
+                        guard let revision = request.arguments["hostRevision"].flatMap(Int.init) else {
+                            throw OutcomeFailure("Missing clipboard ownership", outcome: .noEffect)
+                        }
+                        try await ClipboardBridge.copy(mailbox, request: request, expectedHostRevision: revision)
                     }
-                    try await ClipboardBridge.copy(mailbox, request: request, expectedHostRevision: revision)
+                    else { _ = try await mailbox.call(request) }
                 }
-                else { _ = try await mailbox.call(request) }
                 record(label, ok: true, milliseconds: Date().timeIntervalSince(started) * 1000)
             } catch {
                 // A known no-effect failure keeps the queued input in its original order; an

@@ -119,7 +119,9 @@ public final class InputLease {
     public func release(preserveMetadata: Bool = false, relocatedDirectory: URL? = nil) {
         guard !released else { return }
         released = true
-        if !preserveMetadata {
+        // A borrowed native/CLI operation may still be in flight after its
+        // original holder exits. Its durable fence owns both custody records.
+        if !preserveMetadata && (try? Self.hasOperationFence(relocatedDirectory ?? directory)) == false {
             Self.removeOwnedMetadata(directory: relocatedDirectory ?? directory, receipt: metadataReceipt)
         }
         _ = flock(fd, LOCK_UN)
@@ -263,6 +265,18 @@ public final class InputLease {
         guard (info.st_mode & S_IFMT) == S_IFDIR else { return .unresolved }
         let mailbox = try Mailbox(exchangeURL)
         return mailbox.helperUpdateDisposition() == .unmarked ? .free : .unresolved
+    }
+
+    static func borrowedHolderMatches(directory: URL, owner: String, generation: Int) throws -> Bool {
+        let fd = try openValidatedLock(directory)
+        defer { close(fd) }
+        if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+            _ = flock(fd, LOCK_UN)
+            return false
+        }
+        guard isContention(errno) else { throw Failure("Cannot verify borrowed input custody") }
+        guard let metadata = readMetadata(directory) else { return false }
+        return metadata.owner == owner && metadata.generation == generation
     }
 
     static func hasOperationFence(_ directory: URL) throws -> Bool {

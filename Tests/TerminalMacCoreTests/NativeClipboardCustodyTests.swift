@@ -67,4 +67,25 @@ final class NativeClipboardCustodyTests: XCTestCase {
         XCTAssertEqual(dispatched, 1)
         try mailbox.releaseLeaseFlag(ownedBy: holder.owner)
     }
+    func testBorrowedNativeUnknownSurvivesWindowHolderRelease() async throws {
+        let (directory, mailbox) = try fixture()
+        let holder = try InputLease.acquire(directory: directory, owner: "viewer", generation: 1)
+        try mailbox.publishLeaseFlag(owner: holder.owner, ttl: 120)
+        let session = NativeClipboardCustody(directory: directory, windowOwner: { holder.owner })
+        do {
+            try await session.perform(request: Request(action: "clipboard-paste"), mailbox: mailbox) {
+                // The original viewer can exit while its recovery window is transferring.
+                XCTAssertThrowsError(try mailbox.releaseLeaseFlag(ownedBy: holder.owner))
+                holder.release()
+                XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent(InputLease.metadataName).path))
+                throw OutcomeFailure("lost native result", outcome: .mutationUnknown)
+            }
+            XCTFail("Unknown native outcome")
+        } catch {}
+        XCTAssertTrue(session.isUnconfirmed)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent(InputLease.metadataName).path))
+        XCTAssertFalse(mailbox.helperUpdateDisposition().mayUpdate)
+        XCTAssertThrowsError(try InputLease.acquire(directory: directory, owner: "next", generation: 2))
+    }
+
 }
