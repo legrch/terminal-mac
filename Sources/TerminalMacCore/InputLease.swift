@@ -22,6 +22,7 @@ public struct LeaseConflict: LocalizedError {
 public final class InputLease {
     public static let lockName = "input-lease.lock"
     public static let metadataName = "input-lease.json"
+    public static let operationName = "input-operation.json"
     public static let schema = "terminal-mac.input-lease/1"
 
     public struct Metadata: Codable, Equatable {
@@ -89,6 +90,7 @@ public final class InputLease {
         do {
             // Do not use fileExists: a dangling symlink can appear absent. An unclassifiable
             // lstat error also refuses; only ENOENT proves there is no predecessor metadata.
+            try requireNoOperationFence(directory)
             try requireNoOutstandingMetadata(directory)
             let exchange = try Mailbox(directory.appendingPathComponent("exchange"), create: true)
             try exchange.requireNoOutstandingUpdateMarker()
@@ -168,6 +170,7 @@ public final class InputLease {
 
     /// Injectable syscall seam for deterministic unusual flock errors in Core tests.
     static func probe(directory: URL, attemptLock: (Int32) -> Int32) throws -> Probe {
+        if try hasOperationFence(directory) { return .unresolved }
         let fd = try openValidatedLock(directory)
         defer { close(fd) }
         if attemptLock(fd) == 0 {
@@ -241,6 +244,7 @@ public final class InputLease {
     /// The mailbox opens its directory with O_DIRECTORY|O_NOFOLLOW, and its marker
     /// reader uses O_NONBLOCK, so dangling symlinks and FIFOs cannot hang a probe.
     private static func predecessorProbe(_ directory: URL) throws -> Probe {
+        if try hasOperationFence(directory) { return .unresolved }
         var info = stat()
         let metadata = directory.appendingPathComponent(metadataName).path
         if lstat(metadata, &info) == 0 { return .unresolved }
@@ -259,6 +263,18 @@ public final class InputLease {
         guard (info.st_mode & S_IFMT) == S_IFDIR else { return .unresolved }
         let mailbox = try Mailbox(exchangeURL)
         return mailbox.helperUpdateDisposition() == .unmarked ? .free : .unresolved
+    }
+
+    static func hasOperationFence(_ directory: URL) throws -> Bool {
+        var info = stat()
+        if lstat(directory.appendingPathComponent(operationName).path, &info) == 0 { return true }
+        guard errno == ENOENT else { throw Failure("Cannot inspect guest operation fence") }
+        return false
+    }
+    private static func requireNoOperationFence(_ directory: URL) throws {
+        guard try !hasOperationFence(directory) else {
+            throw Failure("Previous guest input operation is unresolved; reconcile retained operation evidence")
+        }
     }
 
     private static func requireNoOutstandingMetadata(_ directory: URL) throws {

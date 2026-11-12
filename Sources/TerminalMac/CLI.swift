@@ -162,17 +162,15 @@ final class CLI {
             let name = tail[0]
             try validateName(name)
             let directory = try store.directory(name)
-            switch try InputLease.probe(directory: directory) {
-            case .free: break
-            case .unresolved:
-                throw Failure("Previous guest input operation is unresolved; reconcile retained lease evidence before clipboard transfer")
-            case .held, .heldUnknown:
-                throw Failure("Guest input is locked; use a lease-holder action or wait for its completion")
-            }
+            _ = try store.load(name)
             guard try Self.isRunning(directory) else { throw Failure("VM is not running") }
             let mailbox = try Mailbox(directory.appendingPathComponent("exchange"))
-            if tail[1] == "paste" { try await ClipboardBridge.paste(mailbox) }
-            else { try await ClipboardBridge.copy(mailbox) }
+            let request = tail[1] == "paste" ? try ClipboardBridge.pasteRequest() : Request(action: "clipboard-copy", timeout: 5)
+            let custody = try GuestInputCustody.begin(directory: directory, mailbox: mailbox, request: request)
+            try await custody.perform {
+                if tail[1] == "paste" { _ = try await mailbox.call(request) }
+                else { try await ClipboardBridge.copy(mailbox, request: request) }
+            }
             try printJSON(["clipboard": tail[1], "state": "done"])
         case "action": try await action(tail)
         case "mcp":
@@ -279,27 +277,23 @@ final class CLI {
         diagnosticPhase = "admission"
         _ = try store.load(name)
         let directory = try store.directory(name)
-        // A scenario holding the run lease drives its own CLI actions with the same owner token;
-        // anyone else is refused before a request is written.
-        // This one new operation reads bound private service evidence only.
-        // It cannot adopt/start/stop a guest effect or clear a retained fence.
-        if !readOnlyServiceObservation {
-        switch InputLease.admission(probe: try InputLease.probe(directory: directory), claimedOwner: args.options["owner"]) {
-        case .allowed: break
-        case .locked(let holder): throw Failure("Guest input is locked by \(holder); wait for its holder to finish")
-        case .lockedUnknown: throw Failure("Guest input is locked by another client; holder identity is unavailable")
-        case .lockedUnresolved:
-            throw Failure("Previous guest input operation is unresolved; reconcile retained lease evidence before dispatch")
-        }
-        }
         let mailbox = try Mailbox(directory.appendingPathComponent("exchange"))
         let request = Request(action: wireVerb, arguments: parameters, timeout: Double(timeout))
         let imageName = "image-\(request.id.uuidString).png"
         defer { mailbox.remove(imageName) }
         if verb == "screenshot" || verb == "snapshot" { try mailbox.prepareSlot(imageName) }
-        diagnosticPhase = "dispatch"
-        dispatched = true
-        let reply = try await mailbox.call(request)
+        let reply: Reply
+        if readOnlyServiceObservation || ["status", "screenshot", "snapshot"].contains(verb) {
+            diagnosticPhase = "dispatch"; dispatched = true
+            reply = try await mailbox.call(request)
+        } else {
+            let custody = try GuestInputCustody.begin(directory: directory, mailbox: mailbox,
+                request: request, claimedOwner: args.options["owner"])
+            reply = try await custody.perform {
+                diagnosticPhase = "dispatch"; dispatched = true
+                return try await mailbox.call(request)
+            }
+        }
         diagnosticPhase = "output"
         var values = reply.values
         if verb == "screenshot" || verb == "snapshot" {
