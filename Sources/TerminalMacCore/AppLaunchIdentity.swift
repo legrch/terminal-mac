@@ -99,6 +99,10 @@ public enum AppProcessObservation: Equatable {
 
 public enum AppProcessLife: String, Codable {
     case running, exited, unknown
+    /// The original process is absent or unreadable but its registered NOTE_EXIT
+    /// has not been dequeued yet. NOT proof of exit and NOT poisoned identity:
+    /// a drain keeps waiting for the kernel event under its original deadline.
+    case exitPending
 }
 
 public enum AppLaunchIdentity {
@@ -257,11 +261,13 @@ public enum AppLaunchIdentity {
 
     /// Only an exit event registered against the original identity proves that
     /// process exited. Absence, elapsed time or a different start identity do not.
+    /// Absence/unreadability is `exitPending` (wait for the event); a different
+    /// identity or a mismatched kernel event is `unknown` (fail closed).
     public static func life(of expected: AppProcessSnapshot, observation: AppProcessObservation) -> AppProcessLife {
         switch observation {
         case .live(let actual): return actual.sameProcess(as: expected) ? .running : .unknown
         case .originalExit(let key): return key == expected.key ? .exited : .unknown
-        case .absent, .unavailable: return .unknown
+        case .absent, .unavailable: return .exitPending
         }
     }
 }

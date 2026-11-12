@@ -113,6 +113,8 @@ public struct AppQuitDrain {
         guard root != .unknown, primary != .unknown else {
             throw AppLaunchIdentityError.observationUnavailable
         }
+        // `exitPending` is "not yet": absence before the original NOTE_EXIT is
+        // dequeued never completes a drain and never fails it by itself.
         return root == .exited && primary == .exited
     }
 

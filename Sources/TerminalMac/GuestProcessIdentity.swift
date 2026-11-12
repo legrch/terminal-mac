@@ -201,11 +201,11 @@ final class GuestOriginalProcessObserver {
             let life = AppLaunchIdentity.life(of: expected,
                 observation: actual.map(AppProcessObservation.live) ?? .absent)
             // A changed live identity poisons this ownership. A missing sample
-            // is still UNKNOWN, but the original kernel event may later arrive
-            // and be observed without repeating any process operation.
+            // is exitPending: the original kernel event may still arrive and be
+            // observed without repeating any process operation.
             if let actual, !actual.sameProcess(as: expected) { invalid = true }
             return life
-        } catch { return .unknown }
+        } catch { return .exitPending }
     }
 }
 

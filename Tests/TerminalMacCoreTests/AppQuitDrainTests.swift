@@ -376,6 +376,64 @@ final class AppQuitDrainTests: XCTestCase {
     }
 
     @MainActor
+    func testOriginalAbsentBeforeNoteExitWaitsForTheKernelEventThenDrains() async throws {
+        let (_, _, _, drain) = try fixture()
+        var effects = 0, waits = 0, inventories = 0
+        var observations: [AppQuitDrainProgress] = []
+        try await drain.run(check: {}, terminatePrimary: { effects += 1; return true },
+            originals: {
+                if effects == 0 { return (.running, .running) }
+                if waits < 2 { return (.exitPending, .exitPending) }   // gone, event not dequeued
+                if waits < 3 { return (.exited, .exitPending) }
+                return (.exited, .exited)
+            }, inventory: { inventories += 1; return self.census() },
+            nextObservation: { waits += 1 }, observed: { observations.append($0) })
+        XCTAssertEqual(effects, 1)
+        XCTAssertEqual(inventories, 1)
+        XCTAssertEqual(observations, [
+            .originalExitsPending(root: .exitPending, primary: .exitPending),
+            .originalExitsPending(root: .exitPending, primary: .exitPending),
+            .originalExitsPending(root: .exited, primary: .exitPending), .quiescent])
+    }
+
+    @MainActor
+    func testExitPendingUntilOriginalDeadlineFailsWithoutCompletionOrAnotherTermination() async throws {
+        let (_, _, _, drain) = try fixture()
+        var effects = 0, waits = 0, inventories = 0
+        do {
+            try await drain.run(check: { if waits >= 4 { throw TestStop.originalDeadline } },
+                terminatePrimary: { effects += 1; return true },
+                originals: { effects == 0 ? (.running, .running) : (.exited, .exitPending) },
+                inventory: { inventories += 1; return self.census() },
+                nextObservation: { waits += 1 })
+            XCTFail("absence without the original exit event must never complete")
+        } catch { XCTAssertEqual(error as? TestStop, .originalDeadline) }
+        XCTAssertEqual(effects, 1); XCTAssertEqual(inventories, 0)
+    }
+
+    @MainActor
+    func testExitPendingThenChangedOriginalIdentityFailsImmediately() async throws {
+        let (_, _, _, drain) = try fixture()
+        var effects = 0, waits = 0
+        do {
+            try await drain.run(check: {}, terminatePrimary: { effects += 1; return true },
+                originals: {
+                    if effects == 0 { return (.running, .running) }
+                    return waits == 0 ? (.exitPending, .running) : (.unknown, .running)
+                }, inventory: { self.census() }, nextObservation: { waits += 1 })
+            XCTFail("a poisoned original identity must not be waitable")
+        } catch { XCTAssertEqual(error as? AppLaunchIdentityError, .observationUnavailable) }
+        XCTAssertEqual(effects, 1); XCTAssertEqual(waits, 1)
+    }
+
+    func testExitPendingNeitherAdmitsQuitNorSatisfiesClose() throws {
+        XCTAssertThrowsError(try AppLaunchIdentity.requireNormalQuitAdmission(root: .running, primary: .exitPending))
+        XCTAssertFalse(try AppQuitDrain.originalsExited(root: .exited, primary: .exitPending))
+        let (_, _, _, drain) = try fixture()
+        XCTAssertThrowsError(try drain.requireQuiescent(root: .exitPending, primary: .exited, census: census()))
+    }
+
+    @MainActor
     func testUnreadableOrChangedIdentityInventoryErrorIsNotCaughtAsWaitable() async throws {
         let (_, _, _, drain) = try fixture()
         for expected in [AppLaunchIdentityError.censusUnavailable, .changedIdentity, .unrelatedRoot] {

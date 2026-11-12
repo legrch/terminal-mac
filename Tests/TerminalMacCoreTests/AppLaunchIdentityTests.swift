@@ -271,8 +271,9 @@ final class AppLaunchIdentityTests: XCTestCase {
     func testRootExitAndPrimaryExitAreIndependent() {
         XCTAssertEqual(AppLaunchIdentity.life(of: primary, observation: .originalExit(primary.key)), .exited)
         XCTAssertEqual(AppLaunchIdentity.life(of: root, observation: .live(root)), .running)
-        XCTAssertEqual(AppLaunchIdentity.life(of: root, observation: .absent), .unknown)
-        XCTAssertEqual(AppLaunchIdentity.life(of: root, observation: .unavailable), .unknown)
+        // Absence is not exit: it waits for the original NOTE_EXIT, never completes.
+        XCTAssertEqual(AppLaunchIdentity.life(of: root, observation: .absent), .exitPending)
+        XCTAssertEqual(AppLaunchIdentity.life(of: root, observation: .unavailable), .exitPending)
         XCTAssertEqual(AppLaunchIdentity.life(of: root, observation: .originalExit(primary.key)), .unknown)
         XCTAssertEqual(AppLaunchIdentity.life(of: root, observation: .originalExit(root.key)), .exited)
     }
