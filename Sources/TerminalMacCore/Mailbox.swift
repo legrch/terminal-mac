@@ -220,8 +220,8 @@ public final class Mailbox {
         try releaseLeaseFlag(ownedBy: owner, now: now, afterFenceCheck: {})
     }
     /// The hook deterministically exercises a borrower arriving during teardown.
-    func releaseLeaseFlag(ownedBy owner: String, now: Date, afterFenceCheck: () throws -> Void) throws {
-        try InputLease.withAdmission(directoryFD: fd, name: "../input-admission.lock") {
+    func releaseLeaseFlag(ownedBy owner: String, now: Date, wait: Bool = true, afterFenceCheck: () throws -> Void) throws {
+        try InputLease.withAdmission(directoryFD: fd, name: "../input-admission.lock", wait: wait) {
             try releaseLeaseFlagUnderAdmission(ownedBy: owner, now: now, afterFenceCheck: afterFenceCheck)
         }
     }
@@ -231,9 +231,18 @@ public final class Mailbox {
         // still owns its durable dispatch fence in the machine directory.
         var operation = stat()
         let found = fstatat(fd, "../" + InputLease.operationName, &operation, AT_SYMLINK_NOFOLLOW)
-        guard found != 0 && errno == ENOENT else {
+        if found == 0 {
+            switch helperUpdateDisposition(now: now) {
+            case .active(let current) where current == owner, .stale(let current) where current == owner:
+                let machine = openat(fd, "..", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                guard machine >= 0 else { throw Failure("Cannot open input closing directory") }
+                defer { close(machine) }
+                try InputLease.publishClosing(directoryFD: machine, owner: owner)
+            default: break
+            }
             throw Failure("Guest operation fence remains unresolved; preserve helper-update custody")
         }
+        guard errno == ENOENT else { throw Failure("Cannot inspect guest operation fence") }
         try afterFenceCheck()
         switch helperUpdateDisposition(now: now) {
         case .active(let current) where current == owner,

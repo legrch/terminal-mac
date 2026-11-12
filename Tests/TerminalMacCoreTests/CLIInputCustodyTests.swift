@@ -79,7 +79,7 @@ final class CLIInputCustodyTests: XCTestCase {
         let holder = try InputLease.acquire(directory: directory, owner: "scenario", generation: 1)
         try box.publishLeaseFlag(owner: holder.owner, ttl: 120)
         XCTAssertThrowsError(try GuestInputCustody.begin(directory: directory, mailbox: box,
-            request: Request(action: "type"), claimedOwner: holder.owner, afterProbe: { holder.release() }))
+            request: Request(action: "type"), claimedOwner: holder.owner, afterProbe: { holder.release(preserveMetadata: true) }))
         XCTAssertTrue(try box.requests().isEmpty)
         XCTAssertTrue(try InputLease.hasOperationFence(directory))
     }
@@ -109,13 +109,66 @@ final class CLIInputCustodyTests: XCTestCase {
         try box.publishLeaseFlag(owner: holder.owner, ttl: 120)
         let operation = try GuestInputCustody.begin(directory: directory, mailbox: box,
             request: Request(action: "key"), claimedOwner: holder.owner, afterProbe: {
-                XCTAssertThrowsError(try box.releaseLeaseFlag(ownedBy: holder.owner))
+                XCTAssertThrowsError(try box.releaseLeaseFlag(ownedBy: holder.owner, now: Date(), wait: false, afterFenceCheck: {}))
             })
         try await operation.perform {
             XCTAssertFalse(box.helperUpdateDisposition().mayUpdate)
             XCTAssertThrowsError(try box.releaseLeaseFlag(ownedBy: holder.owner))
         }
         try box.releaseLeaseFlag(ownedBy: holder.owner)
+    }
+
+    func testHolderExitThenConfirmedBorrowedSuccessReleasesExactOrphanCustody() async throws {
+        let (_, directory, box) = try fixture()
+        let holder = try InputLease.acquire(directory: directory, owner: "scenario", generation: 1)
+        try box.publishLeaseFlag(owner: holder.owner, ttl: 120)
+        let operation = try GuestInputCustody.begin(directory: directory, mailbox: box,
+            request: Request(action: "key"), claimedOwner: holder.owner)
+        try await operation.perform {
+            XCTAssertThrowsError(try box.releaseLeaseFlag(ownedBy: holder.owner))
+            holder.release(preserveMetadata: true)
+            XCTAssertEqual(try InputLease.probe(directory: directory), .unresolved)
+        }
+        XCTAssertEqual(box.helperUpdateDisposition(), .unmarked)
+        XCTAssertEqual(try InputLease.probe(directory: directory), .free)
+        let next = try InputLease.acquire(directory: directory, owner: "next", generation: 2)
+        next.release()
+    }
+    func testConfirmedBorrowerHandsClosingCustodyBackToStillLiveHolder() async throws {
+        let (_, directory, box) = try fixture()
+        let holder = try InputLease.acquire(directory: directory, owner: "scenario", generation: 1)
+        try box.publishLeaseFlag(owner: holder.owner, ttl: 120)
+        let operation = try GuestInputCustody.begin(directory: directory, mailbox: box,
+            request: Request(action: "key"), claimedOwner: holder.owner)
+        try await operation.perform {
+            XCTAssertThrowsError(try box.releaseLeaseFlag(ownedBy: holder.owner))
+        }
+        XCTAssertFalse(box.helperUpdateDisposition().mayUpdate)
+        XCTAssertThrowsError(try GuestInputCustody.begin(directory: directory, mailbox: box,
+            request: Request(action: "key"), claimedOwner: holder.owner))
+        holder.release(preserveMetadata: true)
+        XCTAssertEqual(box.helperUpdateDisposition(), .unmarked)
+        XCTAssertEqual(try InputLease.probe(directory: directory), .free)
+    }
+    func testConfirmedBorrowerCannotReconcileSubstitutedCustodyRecord() async throws {
+        let (_, directory, box) = try fixture()
+        let holder = try InputLease.acquire(directory: directory, owner: "scenario", generation: 1)
+        try box.publishLeaseFlag(owner: holder.owner, ttl: 120)
+        let operation = try GuestInputCustody.begin(directory: directory, mailbox: box,
+            request: Request(action: "key"), claimedOwner: holder.owner)
+        let metadata = directory.appendingPathComponent(InputLease.metadataName)
+        do {
+            try await operation.perform {
+                holder.release(preserveMetadata: true)
+                let bytes = try Data(contentsOf: metadata)
+                // Same owner/generation/bytes with a different inode is not our receipt.
+                try bytes.write(to: metadata, options: .atomic)
+            }
+            XCTFail("Substituted custody must not be cleared")
+        } catch {}
+        XCTAssertTrue(try InputLease.hasOperationFence(directory))
+        XCTAssertFalse(box.helperUpdateDisposition().mayUpdate)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: metadata.path))
     }
 
 }

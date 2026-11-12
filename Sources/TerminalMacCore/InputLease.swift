@@ -23,6 +23,7 @@ public final class InputLease {
     public static let lockName = "input-lease.lock"
     public static let metadataName = "input-lease.json"
     public static let operationName = "input-operation.json"
+    static let closingName = "input-closing.json"
     public static let schema = "terminal-mac.input-lease/1"
 
     public struct Metadata: Codable, Equatable {
@@ -39,7 +40,7 @@ public final class InputLease {
     private var released = false
     // The exact file this acquisition created. Stale or substituted records are not ours
     // to remove, even if they carry the same owner text.
-    private struct MetadataReceipt {
+    struct MetadataReceipt: Equatable {
         let device: UInt64
         let inode: UInt64
         let bytes: Data
@@ -91,6 +92,7 @@ public final class InputLease {
             // Do not use fileExists: a dangling symlink can appear absent. An unclassifiable
             // lstat error also refuses; only ENOENT proves there is no predecessor metadata.
             try requireNoOperationFence(directory)
+            guard try !hasClosingFence(directory) else { throw Failure("Input holder teardown remains unresolved") }
             try requireNoOutstandingMetadata(directory)
             let exchange = try Mailbox(directory.appendingPathComponent("exchange"), create: true)
             try exchange.requireNoOutstandingUpdateMarker()
@@ -121,12 +123,18 @@ public final class InputLease {
         released = true
         // A borrowed native/CLI operation may still be in flight after its
         // original holder exits. Its durable fence owns both custody records.
-        if !preserveMetadata {
-            let location = relocatedDirectory ?? directory
-            try? Self.withAdmission(directory: location) {
-                if try !Self.hasOperationFence(location) {
-                    Self.removeOwnedMetadata(directory: location, receipt: metadataReceipt)
+        let location = relocatedDirectory ?? directory
+        if !preserveMetadata || (try? Self.hasClosingFence(location)) == true {
+            try? Self.withAdmission(directory: location, wait: true) {
+                guard try !Self.hasOperationFence(location) else { return }
+                let closing = try Self.closingMatches(directory: location, owner: owner)
+                guard !preserveMetadata || closing else { return }
+                if closing {
+                    let box = try Mailbox(location.appendingPathComponent("exchange"))
+                    try box.releaseLeaseFlagUnderAdmission(ownedBy: owner)
                 }
+                guard Self.removeOwnedMetadata(directory: location, receipt: metadataReceipt) else { return }
+                if closing { try Self.removeClosing(directory: location) }
             }
         }
         _ = flock(fd, LOCK_UN)
@@ -150,13 +158,13 @@ public final class InputLease {
 
     /// Short cross-process admission barrier shared by operation publication,
     /// marker teardown and metadata release. Never wait behind another client.
-    static func withAdmission<T>(directory: URL, _ body: () throws -> T) throws -> T {
+    static func withAdmission<T>(directory: URL, wait: Bool = false, _ body: () throws -> T) throws -> T {
         let fd = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { throw Failure("Cannot open input admission directory") }
         defer { close(fd) }
-        return try withAdmission(directoryFD: fd, name: "input-admission.lock", body)
+        return try withAdmission(directoryFD: fd, name: "input-admission.lock", wait: wait, body)
     }
-    static func withAdmission<T>(directoryFD: Int32, name: String, _ body: () throws -> T) throws -> T {
+    static func withAdmission<T>(directoryFD: Int32, name: String, wait: Bool = false, _ body: () throws -> T) throws -> T {
         let lock = openat(directoryFD, name, O_CREAT | O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0o600)
         guard lock >= 0 else { throw Failure("Cannot open input admission lock") }
         defer { close(lock) }
@@ -165,7 +173,7 @@ public final class InputLease {
               info.st_nlink == 1, info.st_uid == geteuid(), info.st_mode & 0o077 == 0 else {
             throw Failure("Unsafe input admission lock")
         }
-        guard flock(lock, LOCK_EX | LOCK_NB) == 0 else { throw Failure("Guest input custody is changing; dispatch refused") }
+        guard flock(lock, wait ? LOCK_EX : LOCK_EX | LOCK_NB) == 0 else { throw Failure("Guest input custody is changing; dispatch refused") }
         defer { _ = flock(lock, LOCK_UN) }
         return try body()
     }
@@ -199,7 +207,7 @@ public final class InputLease {
 
     /// Injectable syscall seam for deterministic unusual flock errors in Core tests.
     static func probe(directory: URL, attemptLock: (Int32) -> Int32) throws -> Probe {
-        if try hasOperationFence(directory) { return .unresolved }
+        if try hasOperationFence(directory) || hasClosingFence(directory) { return .unresolved }
         let fd = try openValidatedLock(directory)
         defer { close(fd) }
         if attemptLock(fd) == 0 {
@@ -250,7 +258,8 @@ public final class InputLease {
 
     /// A holder's identity is diagnostic only, and a missing/unsafe metadata file
     /// must never block on a FIFO or authorize a guessed owner token.
-    private static func readMetadata(_ directory: URL) -> Metadata? {
+    private static func readMetadata(_ directory: URL) -> Metadata? { readMetadataRecord(directory)?.0 }
+    private static func readMetadataRecord(_ directory: URL) -> (Metadata, MetadataReceipt)? {
         let path = directory.appendingPathComponent(metadataName).path
         let input = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard input >= 0 else { return nil }
@@ -264,7 +273,34 @@ public final class InputLease {
         guard count == Int(info.st_size), let metadata = try? JSONDecoder().decode(Metadata.self, from: data),
               metadata.schema == schema,
               (try? validate(owner: metadata.owner)) != nil else { return nil }
-        return metadata
+        return (metadata, MetadataReceipt(device: UInt64(info.st_dev), inode: UInt64(info.st_ino), bytes: data))
+    }
+
+    static func borrowedMetadataReceipt(directory: URL, owner: String, generation: Int) throws -> MetadataReceipt {
+        guard let (metadata, receipt) = readMetadataRecord(directory), metadata.owner == owner,
+              metadata.generation == generation else { throw Failure("Cooperative holder metadata changed") }
+        return receipt
+    }
+
+    /// Called under admission. A live holder drains a closing request on release;
+    /// an exited holder is reconciled under its original, now-free kernel lock.
+    static func finishBorrowed(directory: URL, receipt: MetadataReceipt,
+                               confirmed: (Bool) throws -> Void) throws {
+        let lock = try openValidatedLock(directory)
+        defer { close(lock) }
+        let orphaned = flock(lock, LOCK_EX | LOCK_NB) == 0
+        if !orphaned && !isContention(errno) { throw Failure("Cannot reconcile cooperative completion") }
+        defer { if orphaned { _ = flock(lock, LOCK_UN) } }
+        guard let (_, actual) = readMetadataRecord(directory), actual == receipt else {
+            throw Failure("Cooperative custody record changed; preserve operation evidence")
+        }
+        try confirmed(orphaned)
+        if orphaned {
+            guard removeOwnedMetadata(directory: directory, receipt: receipt) else {
+                throw Failure("Cannot durably release confirmed orphan custody")
+            }
+            if try hasClosingFence(directory) { try removeClosing(directory: directory) }
+        }
     }
 
     /// Read-only predecessor admission after the probe acquired the kernel lock.
@@ -273,7 +309,7 @@ public final class InputLease {
     /// The mailbox opens its directory with O_DIRECTORY|O_NOFOLLOW, and its marker
     /// reader uses O_NONBLOCK, so dangling symlinks and FIFOs cannot hang a probe.
     private static func predecessorProbe(_ directory: URL) throws -> Probe {
-        if try hasOperationFence(directory) { return .unresolved }
+        if try hasOperationFence(directory) || hasClosingFence(directory) { return .unresolved }
         var info = stat()
         let metadata = directory.appendingPathComponent(metadataName).path
         if lstat(metadata, &info) == 0 { return .unresolved }
@@ -306,9 +342,11 @@ public final class InputLease {
         return metadata.owner == owner && metadata.generation == generation
     }
 
-    static func hasOperationFence(_ directory: URL) throws -> Bool {
+    static func hasOperationFence(_ directory: URL) throws -> Bool { try hasEvidence(directory, name: operationName) }
+    static func hasClosingFence(_ directory: URL) throws -> Bool { try hasEvidence(directory, name: closingName) }
+    private static func hasEvidence(_ directory: URL, name: String) throws -> Bool {
         var info = stat()
-        if lstat(directory.appendingPathComponent(operationName).path, &info) == 0 { return true }
+        if lstat(directory.appendingPathComponent(name).path, &info) == 0 { return true }
         guard errno == ENOENT else { throw Failure("Cannot inspect guest operation fence") }
         return false
     }
@@ -369,16 +407,17 @@ public final class InputLease {
         return MetadataReceipt(device: UInt64(info.st_dev), inode: UInt64(info.st_ino), bytes: data)
     }
 
-    private static func removeOwnedMetadata(directory: URL, receipt: MetadataReceipt) {
+    @discardableResult
+    private static func removeOwnedMetadata(directory: URL, receipt: MetadataReceipt) -> Bool {
         let path = directory.appendingPathComponent(metadataName).path
         let input = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-        guard input >= 0 else { return }
+        guard input >= 0 else { return false }
         defer { close(input) }
         var info = stat()
         guard fstat(input, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
               info.st_nlink == 1, info.st_uid == geteuid(), info.st_mode & 0o077 == 0,
               UInt64(info.st_dev) == receipt.device,
-              UInt64(info.st_ino) == receipt.inode, info.st_size == receipt.bytes.count else { return }
+              UInt64(info.st_ino) == receipt.inode, info.st_size == receipt.bytes.count else { return false }
         var bytes = Data(count: receipt.bytes.count)
         let count = bytes.withUnsafeMutableBytes { pointer -> Int in
             guard let base = pointer.baseAddress else { return 0 }
@@ -391,13 +430,44 @@ public final class InputLease {
             }
             return offset
         }
-        guard count == receipt.bytes.count, bytes == receipt.bytes else { return }
+        guard count == receipt.bytes.count, bytes == receipt.bytes else { return false }
         // Protect against a swapped pathname after opening the descriptor. The kernel flock
         // serializes cooperative owners; this is not an adversarial filesystem transaction.
         var named = stat()
         guard lstat(path, &named) == 0, UInt64(named.st_dev) == receipt.device,
-              UInt64(named.st_ino) == receipt.inode else { return }
-        if unlink(path) == 0 { syncDirectory(directory) }
+              UInt64(named.st_ino) == receipt.inode else { return false }
+        guard unlink(path) == 0 else { return false }
+        return (try? syncDirectoryChecked(directory)) != nil
+    }
+
+    /// Closing intent is durable before the holder can abandon its kernel lock.
+    static func publishClosing(directoryFD: Int32, owner: String) throws {
+        try validate(owner: owner)
+        let out = openat(directoryFD, closingName, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard out >= 0 else { throw Failure("Cannot publish input closing intent; preserve custody") }
+        defer { close(out) }
+        let data = Data(owner.utf8)
+        try data.withUnsafeBytes { bytes in
+            var offset = 0
+            while offset < bytes.count {
+                let count = Darwin.write(out, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+                if count < 0 && errno == EINTR { continue }
+                guard count > 0 else { throw Failure("Cannot write input closing intent") }
+                offset += count
+            }
+        }
+        guard fsync(out) == 0, fsync(directoryFD) == 0 else { throw Failure("Input closing intent durability is unconfirmed") }
+    }
+    static func closingMatches(directory: URL, owner: String) throws -> Bool {
+        guard let data = try Mailbox(directory).read(closingName, limit: 128) else { return false }
+        guard data == Data(owner.utf8) else { throw Failure("Input closing owner changed; preserve custody") }
+        return true
+    }
+    private static func removeClosing(directory: URL) throws {
+        guard unlink(directory.appendingPathComponent(closingName).path) == 0 else {
+            throw Failure("Cannot release input closing intent")
+        }
+        try syncDirectoryChecked(directory)
     }
 
     private static func syncDirectoryChecked(_ directory: URL) throws {

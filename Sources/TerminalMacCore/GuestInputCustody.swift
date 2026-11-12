@@ -9,6 +9,8 @@ public final class GuestInputCustody {
     private let mailbox: Mailbox
     private let directory: Int32
     private let owner: String
+    private let location: URL
+    private let borrowedReceipt: InputLease.MetadataReceipt?
     private var completed = false
 
     public static func begin(directory: URL, mailbox: Mailbox, request: Request,
@@ -76,7 +78,9 @@ public final class GuestInputCustody {
 
     private init(directory url: URL, mailbox: Mailbox, request: Request,
                  owner: String, generation: Int, lease: InputLease?) throws {
-        self.lease = lease; self.mailbox = mailbox; self.owner = owner
+        self.lease = lease; self.mailbox = mailbox; self.owner = owner; location = url
+        borrowedReceipt = lease == nil ? try InputLease.borrowedMetadataReceipt(
+            directory: url, owner: owner, generation: generation) : nil
         directory = open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard directory >= 0 else { throw Failure("Cannot open guest operation evidence directory") }
         do {
@@ -119,13 +123,24 @@ public final class GuestInputCustody {
     }
     private func finishConfirmed() throws {
         do {
-            guard unlinkat(directory, InputLease.operationName, 0) == 0, fsync(directory) == 0 else {
-                throw Failure("Cannot durably release guest operation fence")
+            try InputLease.withAdmission(directory: location) {
+                func removeFence() throws {
+                    guard unlinkat(directory, InputLease.operationName, 0) == 0, fsync(directory) == 0 else {
+                        throw Failure("Cannot durably release guest operation fence")
+                    }
+                }
+                if let receipt = borrowedReceipt {
+                    _ = try InputLease.closingMatches(directory: location, owner: owner)
+                    try InputLease.finishBorrowed(directory: location, receipt: receipt) { orphaned in
+                        try removeFence()
+                        if orphaned { try mailbox.releaseLeaseFlagUnderAdmission(ownedBy: owner) }
+                    }
+                } else {
+                    try removeFence()
+                    try mailbox.releaseLeaseFlagUnderAdmission(ownedBy: owner)
+                }
             }
-            if let lease {
-                try mailbox.releaseLeaseFlag(ownedBy: owner)
-                lease.release()
-            }
+            lease?.release()
         } catch {
             lease?.release(preserveMetadata: true)
             throw error
