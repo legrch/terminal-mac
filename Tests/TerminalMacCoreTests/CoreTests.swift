@@ -6,7 +6,7 @@ import Darwin
 final class CoreTests: XCTestCase {
     func testArtifactShareIsPrivateAndRejectsAliasesAndFiles() throws {
         let manager = FileManager.default
-        guard let physical = realpath(manager.temporaryDirectory.path, nil) else { throw Failure("Cannot resolve disposable test directory") }
+        guard let physical = realpath(testTemporaryDirectory.path, nil) else { throw Failure("Cannot resolve disposable test directory") }
         defer { free(physical) }
         let root = URL(fileURLWithPath: String(cString: physical)).appendingPathComponent(UUID().uuidString)
         try manager.createDirectory(at: root, withIntermediateDirectories: true)
