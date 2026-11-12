@@ -39,6 +39,10 @@ final class TerminalViewer {
     let machine: Machine
     let graphics: String
     let readOnly: Bool
+    static let leaseOwner = "viewer"
+    static func recoveryWindowRequest() -> Request {
+        Request(action: "show", arguments: ["leaseOwner": leaseOwner], timeout: 5)
+    }
     private let writer = TerminalWriter()
     private let renderer: DesktopRenderer
     private var metrics = TerminalMetricFilter()
@@ -119,7 +123,7 @@ final class TerminalViewer {
         var framesDrained = false
         // The viewer owns guest input while it runs: other CLI/MCP/scenario clients are refused
         // until it exits, and the guest helper defers self-replacement while the flag is up.
-        let lease = try InputLease.acquire(directory: directory, owner: "viewer", generation: Int(Date().timeIntervalSince1970))
+        let lease = try InputLease.acquire(directory: directory, owner: Self.leaseOwner, generation: Int(Date().timeIntervalSince1970))
         var markerPublished = false
         defer {
             // A timed-out action or unjoined frame task may outlive this terminal session.
@@ -130,7 +134,7 @@ final class TerminalViewer {
                                                     inputInFlight: inFlight,
                                                     outcomeUnknown: guestOutcomeUnconfirmed) {
                 do {
-                    try mailbox.releaseLeaseFlag(ownedBy: "viewer")
+                    try mailbox.releaseLeaseFlag(ownedBy: Self.leaseOwner)
                     cleanMarkerRelease = true
                 } catch { /* Retain both records for reconciliation. */ }
             }
@@ -139,10 +143,10 @@ final class TerminalViewer {
         // InputLease.acquire checked the predecessor marker under flock before publishing
         // machine metadata. Re-check here to reject a concurrent out-of-contract publisher.
         try mailbox.requireNoOutstandingUpdateMarker()
-        try mailbox.publishLeaseFlag(owner: "viewer", ttl: 120)
+        try mailbox.publishLeaseFlag(owner: Self.leaseOwner, ttl: 120)
         markerPublished = true
         var lastFlagPublish = Date()
-        func refreshLeaseFlag() { if Date().timeIntervalSince(lastFlagPublish) >= 30 { lastFlagPublish = Date(); try? mailbox.publishLeaseFlag(owner: "viewer", ttl: 120) } }
+        func refreshLeaseFlag() { if Date().timeIntervalSince(lastFlagPublish) >= 30 { lastFlagPublish = Date(); try? mailbox.publishLeaseFlag(owner: Self.leaseOwner, ttl: 120) } }
         var parser = TerminalInput(), lastInput = Date(), previousSize = "", lastChrome = Date.distantPast
         let started = Date()
         while !quit {
@@ -267,7 +271,7 @@ final class TerminalViewer {
         loginWindow = true
         record("Opened the VM window · it hides once the guest is ready", ok: true)
         Task { @MainActor in
-            do { _ = try await host.call(Request(action: "show", timeout: 5)) }
+            do { _ = try await host.call(Self.recoveryWindowRequest()) }
             catch { loginWindow = false; record("Cannot open the VM window: \(error.localizedDescription)", ok: false) }
         }
     }
