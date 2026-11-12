@@ -232,3 +232,18 @@ long `stopping` seen that day. After 60 seconds the runtime now reports
 and only while a stop is pending, guest input is neither held nor fenced and the
 live helper has Accessibility; it never forces. All 228 XCTest cases pass; live
 qualification of both changes remains pending.
+
+### Helper18 base grants and live confirmed stop (November 12, 2026)
+
+On macOS 27 guests the Accessibility list is **Privacy & Security → Device Control
+and Data Access**; Screen Recording is **Screen & System Audio Recording**. An ad-hoc
+rebuild changes the helper's code identity, so the old entry with the same name does
+not apply: remove TerminalMacGuest with "−", add `/Applications/TerminalMacGuest.app`
+with "+", and enable it in both lists. Turning automatic macOS updates off in a base
+needs the guest account password (owner-only).
+
+`farol-base-3` with helper18 (both grants) then ran `stop --confirm-guest-dialog`:
+the guest powered off about 24 seconds after the command (10 s wait, one press).
+The CLI itself reported a status timeout because the runtime exited mid-status; a
+released runtime lock is now read as stopped, and a press whose reply is lost to
+power-off reports `guestDialogConfirmed=unconfirmed-reply`. 228 XCTest cases pass.

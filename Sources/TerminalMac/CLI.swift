@@ -348,7 +348,12 @@ final class CLI {
         let directory = try store.directory(name)
         func state() async throws -> String {
             guard try runtimeIsLocked(directory) else { return "stopped" }
-            return try await host(name, action: "status").values["state"] ?? "unknown"
+            do { return try await host(name, action: "status").values["state"] ?? "unknown" }
+            catch {
+                // The runtime can exit while answering: its released lock is the stop.
+                if !(try runtimeIsLocked(directory)) { return "stopped" }
+                throw error
+            }
         }
         func waitStopped(seconds: Int) async throws -> String {
             for _ in 0..<seconds {
@@ -372,9 +377,17 @@ final class CLI {
                                                helperAccessibility: helper?.values["accessibility"]) else {
             throw Failure("Guest shutdown confirmation is not admissible (state \(current)); the stop request remains pending")
         }
-        let pressed = try await mailbox.call(Request(action: GuestStopConfirmation.guestAction, timeout: 15))
+        // One press, never retried. The guest may power off before its reply lands.
+        var confirmed = "unconfirmed"
+        do {
+            let pressed = try await mailbox.call(Request(action: GuestStopConfirmation.guestAction, timeout: 15))
+            confirmed = pressed.values["pressed"] == "true" ? "true" : "false"
+        } catch {
+            guard try await waitStopped(seconds: 60) == "stopped" else { throw error }
+            return ["state": "stopped", "guestDialogConfirmed": "unconfirmed-reply"]
+        }
         let final = try await waitStopped(seconds: 60)
-        return ["state": final, "guestDialogConfirmed": pressed.values["pressed"] ?? "false"]
+        return ["state": final, "guestDialogConfirmed": confirmed]
     }
     func runtimeIsLocked(_ directory: URL) throws -> Bool { try Self.isRunning(directory) }
     static func isRunning(_ directory: URL) throws -> Bool {
