@@ -168,8 +168,10 @@ final class StoreCloneTests: XCTestCase {
         try machine("pilot", in: root)
         let source = try store.directory("pilot")
         var checked = false
-        try store.clone(from: "pilot", to: "copy", identityData: Data("fresh".utf8), beforeCopy: {
+        try store.clone(from: "pilot", to: "copy", identityData: Data("fresh".utf8), duringCopy: {
             checked = true
+            XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("machines/copy/disk.img").path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("machines/copy/auxiliary.bin").path))
             XCTAssertThrowsError(try FileLock(source.appendingPathComponent("runtime.lock")))
             XCTAssertThrowsError(try InputLease.acquire(directory: source, owner: "competitor", generation: 2))
             XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("machines/copy/clone.json").path))

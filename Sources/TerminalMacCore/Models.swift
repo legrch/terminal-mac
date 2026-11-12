@@ -219,10 +219,10 @@ public struct Store {
     /// destination is created new or not at all. The receipt binds provenance: a COW clone's
     /// disk bytes equal the source disk at clone time.
     public func clone(from: String, to: String, identityData: Data, offline: Bool = false) throws {
-        try clone(from: from, to: to, identityData: identityData, offline: offline, beforeCopy: {})
+        try clone(from: from, to: to, identityData: identityData, offline: offline, duringCopy: {})
     }
     func clone(from: String, to: String, identityData: Data, offline: Bool = false,
-               beforeCopy: () throws -> Void) throws {
+               duringCopy: () throws -> Void) throws {
         try validateName(from)
         try validateName(to)
         guard from != to else { throw Failure("Cloning '\(from)' to itself changes nothing") }
@@ -244,11 +244,10 @@ public struct Store {
         let input = try InputLease.acquire(directory: source, owner: "clone:" + UUID().uuidString, generation: 0)
         defer { input.release() }
         _ = try load(from)
-        try beforeCopy()
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         // The destination is new, so any failure removes the partial directory instead of leaving it.
         do { try Self.copyMachine(from: from, to: to, source: source, destination: destination,
-                                  identityData: identityData, offline: offline) }
+                                  identityData: identityData, offline: offline, duringCopy: duringCopy) }
         catch {
             try? FileManager.default.removeItem(at: destination)
             throw error
@@ -256,10 +255,11 @@ public struct Store {
     }
 
     static func copyMachine(from: String, to: String, source: URL, destination: URL,
-                            identityData: Data, offline: Bool) throws {
+                            identityData: Data, offline: Bool, duringCopy: () throws -> Void = {}) throws {
         // Hash the source disk first: it proves readability and binds provenance before anything is written.
         let diskDigest = try fileDigest(source.appendingPathComponent("disk.img"))
         try copyStateFile("disk.img", from: source, to: destination, clonable: true)
+        try duringCopy()
         try copyStateFile("auxiliary.bin", from: source, to: destination, clonable: true)
         try copyStateFile("hardware.bin", from: source, to: destination, clonable: false)
         try copyStateFile("machine.json", from: source, to: destination, clonable: false)
