@@ -2,6 +2,13 @@ import AppKit
 import ServiceManagement
 import TerminalMacCore
 
+extension NSRunningApplication {
+    /// Kernel truth for liveness. NSRunningApplication.isTerminated only updates
+    /// while the main run loop spins, which the guest entry path never does, so
+    /// it stayed false for a helper that was already gone (live guest log).
+    var exited: Bool { kill(processIdentifier, 0) != 0 && errno == ESRCH }
+}
+
 @MainActor
 enum GuestBootstrap {
     /// New installers and native application sessions share this guest-local
@@ -91,7 +98,7 @@ enum GuestBootstrap {
         }
         let running = NSRunningApplication.runningApplications(withBundleIdentifier: "dev.terminal-mac.guest")
             .filter { $0.bundleURL?.resolvingSymlinksInPath() == destination.resolvingSymlinksInPath() &&
-                      $0.processIdentifier != exceptPID }
+                      $0.processIdentifier != exceptPID && !$0.exited }
         for application in running { _ = application.terminate() }
         if !running.isEmpty { askedOthersToQuit = true }
         // An installed helper finishing its run loop can take seconds to quit; a
@@ -102,15 +109,15 @@ enum GuestBootstrap {
         // custody checks above already prove no service or input is in flight,
         // so after a grace period the old helper is stopped forcibly.
         for tick in 0..<800 {
-            if running.allSatisfy({ $0.isTerminated }) { break }
+            if running.allSatisfy({ $0.exited }) { break }
             if tick == 200 {
-                for application in running where !application.isTerminated { _ = application.forceTerminate() }
-                log("install: forced \(running.filter { !$0.isTerminated }.count) helper(s) that ignored quit")
+                for application in running where !application.exited { _ = application.forceTerminate() }
+                log("install: forced \(running.filter { !$0.exited }.count) helper(s) that ignored quit")
             }
             try await Task.sleep(nanoseconds: 50_000_000)
         }
-        log("install: \(running.count) other installed helper(s) quit=\(running.allSatisfy { $0.isTerminated })")
-        guard running.allSatisfy({ $0.isTerminated }) else {
+        log("install: \(running.count) other installed helper(s) quit=\(running.allSatisfy { $0.exited })")
+        guard running.allSatisfy({ $0.exited }) else {
             log("install: refused, another installed helper did not quit")
             throw Failure("Quit the installed guest helper, then reopen this copy to update it")
         }
@@ -155,19 +162,20 @@ enum GuestBootstrap {
         guard let app = launched else { throw Failure("Helper launch returned no application") }
         observe(app)
         while !app.isFinishedLaunching {
-            guard !app.isTerminated, Date().timeIntervalSince(started) < timeout else {
+            guard !app.exited, Date().timeIntervalSince(started) < timeout else {
                 throw Failure("Helper did not finish launching")
             }
             try await Task.sleep(nanoseconds: 100_000_000)
         }
         try await Task.sleep(nanoseconds: 2_000_000_000)
-        guard !app.isTerminated else { throw Failure("Helper exited right after launch") }
+        guard !app.exited else { throw Failure("Helper exited right after launch") }
         log("launch: running pid=\(app.processIdentifier) \(destination.path)")
     }
 
     static func instances(at destination: URL, except pid: pid_t) -> [NSRunningApplication] {
         NSRunningApplication.runningApplications(withBundleIdentifier: "dev.terminal-mac.guest").filter {
-            $0.bundleURL?.resolvingSymlinksInPath() == destination.resolvingSymlinksInPath() && $0.processIdentifier != pid
+            $0.bundleURL?.resolvingSymlinksInPath() == destination.resolvingSymlinksInPath() && $0.processIdentifier != pid &&
+                !$0.exited
         }
     }
     /// Stops instances started by a failed hand-over; true only when none survive.
@@ -175,11 +183,11 @@ enum GuestBootstrap {
         let others = instances(at: destination, except: getpid())
         for app in others { _ = app.terminate() }
         for tick in 0..<200 {
-            if others.allSatisfy({ $0.isTerminated }) { return true }
-            if tick == 100 { for app in others where !app.isTerminated { _ = app.forceTerminate() } }
+            if others.allSatisfy({ $0.exited }) { return true }
+            if tick == 100 { for app in others where !app.exited { _ = app.forceTerminate() } }
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
-        return others.allSatisfy { $0.isTerminated }
+        return others.allSatisfy { $0.exited }
     }
     /// Best effort: make sure an installed helper runs after a failed explicit install.
     /// Set once an install asked another installed helper to quit.
