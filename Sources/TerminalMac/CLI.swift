@@ -5,7 +5,8 @@ import Darwin
 
 @MainActor
 final class CLI {
-    let store = Store()
+    let store: Store
+    init(store: Store = Store()) { self.store = store }
     var runtime: MachineRuntime?
     var guest: GuestRuntime?
     var executableURL: URL {
@@ -60,7 +61,7 @@ final class CLI {
             let machine = try store.load(name)
             guard machine.installed else { throw Failure("Installation did not complete. See the VM directory and README recovery instructions.") }
             let directory = try store.directory(name)
-            if runtimeIsLocked(directory) {
+            if try runtimeIsLocked(directory) {
                 if args.flags.contains("window") { _ = try await host(name, action: "show") }
                 if !quietStartup { try printJSON(["name": name, "state": "already-running"]) }; return
             }
@@ -95,34 +96,96 @@ final class CLI {
             // Keep the app event loop and runtime alive until guest shutdown.
             while true { try await Task.sleep(nanoseconds: 1_000_000_000) }
         case "status", "show", "hide", "pause", "resume", "stop":
-            let args = try Arguments(tail, flags: command == "stop" ? ["force"] : [])
+            let args = try Arguments(tail, flags: command == "stop" ? ["force", "confirm-guest-dialog"] : [], options: ["owner"])
             let name = try args.machineName()
             _ = try store.load(name)
-            if command == "status", !runtimeIsLocked(try store.directory(name)) {
+            if command == "status", !(try runtimeIsLocked(store.directory(name))) {
                 try printJSON(["name": name, "state": "stopped"]); return
             }
-            let reply = try await host(name, action: command, arguments: ["force": String(args.flags.contains("force"))])
+            var lifecycle = ["force": String(args.flags.contains("force"))]
+            // The lease holder that deliberately shows the login window stays interactive in it.
+            if let owner = args.options["owner"] { lifecycle["leaseOwner"] = owner }
+            if command == "stop", args.flags.contains("confirm-guest-dialog") {
+                guard !args.flags.contains("force") else { throw Failure("Use either --force or --confirm-guest-dialog") }
+                try printJSON(try await stopConfirmingGuestDialog(name))
+                return
+            }
+            let reply = try await host(name, action: command, arguments: lifecycle)
             try printJSON(reply.values)
+        case "lease":
+            let args = try Arguments(tail)
+            guard args.positionals.count == 2, args.positionals[1] == "status" else {
+                throw Failure("Usage: terminal-mac lease NAME status. Acquisition is programmatic: long-running clients flock <machine>/input-lease.lock; `action --owner NAME` drives the guest under that lease.")
+            }
+            let name = args.positionals[0]
+            try validateName(name)
+            let directory = try store.directory(name)
+            _ = try store.load(name)
+            let state = try InputLease.probe(directory: directory)
+            let response: [String: Any]
+            switch state {
+            case .free: response = ["held": false, "owner": NSNull()]
+            case .held(let owner, _): response = ["held": true, "owner": owner]
+            case .heldUnknown: response = ["held": true, "owner": NSNull(), "state": "holder-unknown"]
+            case .unresolved:
+                // The kernel lock is free but persistent evidence forbids new input.
+                // Preserve held's kernel-lock meaning; consumers must inspect state.
+                response = ["held": false, "owner": NSNull(), "state": "unresolved-predecessor",
+                            "inputAllowed": false]
+            }
+            let status = try JSONSerialization.data(withJSONObject: response,
+                                                    options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+            print(String(decoding: status, as: UTF8.self))
+        case "rename":
+            let args = try Arguments(tail)
+            guard args.positionals.count == 2 else { throw Failure("Usage: terminal-mac rename OLD NEW") }
+            try store.rename(args.positionals[0], to: args.positionals[1])
+            try printJSON(["from": args.positionals[0], "to": args.positionals[1], "state": "RENAMED"])
+        case "clone":
+            let args = try Arguments(tail, flags: ["offline"])
+            guard args.positionals.count == 2 else { throw Failure("Usage: terminal-mac clone OLD NEW [--offline]") }
+            let identity = VZMacMachineIdentifier().dataRepresentation
+            try store.clone(from: args.positionals[0], to: args.positionals[1], identityData: identity,
+                            offline: args.flags.contains("offline"))
+            try printJSON(["from": args.positionals[0], "to": args.positionals[1], "state": "CLONED"])
         case "display":
             let args = try Arguments(tail, flags: ["hidpi", "standard"])
             let name = try args.machineName()
             var machine = try store.load(name)
             guard args.flags.count == 1 else { throw Failure("Usage: terminal-mac display [NAME] --hidpi|--standard") }
-            guard !runtimeIsLocked(try store.directory(name)) else { throw Failure("Stop the VM first: terminal-mac stop \(name). The display mode applies at the next boot.") }
+            guard !(try runtimeIsLocked(store.directory(name))) else { throw Failure("Stop the VM first: terminal-mac stop \(name). The display mode applies at the next boot.") }
             machine.scale = args.flags.contains("hidpi") ? 2 : 1
             try store.save(machine)
             try printJSON(["name": name, "display": "\(machine.width)×\(machine.height) points at \(machine.displayScale)x"])
+        case "clipboard":
+            guard tail.count == 2, ["copy", "paste"].contains(tail[1]) else { throw Failure("Usage: terminal-mac clipboard NAME copy|paste") }
+            let name = tail[0]
+            try validateName(name)
+            let directory = try store.directory(name)
+            _ = try store.load(name)
+            guard try Self.isRunning(directory) else { throw Failure("VM is not running") }
+            let mailbox = try Mailbox(directory.appendingPathComponent("exchange"))
+            let request = tail[1] == "paste" ? try ClipboardBridge.pasteRequest() : Request(action: "clipboard-copy", timeout: 5)
+            let custody = try GuestInputCustody.begin(directory: directory, mailbox: mailbox, request: request)
+            try await custody.perform {
+                if tail[1] == "paste" { _ = try await mailbox.call(request) }
+                else { try await ClipboardBridge.copy(mailbox, request: request) }
+            }
+            try printJSON(["clipboard": tail[1], "state": "done"])
         case "action": try await action(tail)
         case "mcp":
-            let args = try Arguments(tail, flags: ["config"])
+            let args = try Arguments(tail, flags: ["config"],
+                                     options: ["app-run", "app-manifest", "app-acceptance"])
             let name = try args.machineName()
+            let selectedApp = try AppMCPSelection.optional(
+                args.options, config: args.flags.contains("config"))
             if args.flags.contains("config") {
                 // Point clients at the launcher, not the versioned bundle, so upgrades keep working.
                 let server: [String: Any] = ["command": launcherPath, "args": name == "default" ? ["mcp"] : ["mcp", name]]
                 let data = try JSONSerialization.data(withJSONObject: ["mcpServers": ["terminal-mac": server]], options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
                 print(String(decoding: data, as: UTF8.self)); return
             }
-            try await AgentServer(store: store, name: name).run()
+            try await AgentServer(store: store, name: name, appSelection: selectedApp).run()
         case "skills":
             let args = try Arguments(tail, options: ["dir"])
             guard let skill = bundledSkill else { throw Failure("This build has no bundled skill. Reinstall terminal-mac.") }
@@ -145,7 +208,7 @@ final class CLI {
             let args = try Arguments(tail, flags: ["read-only"], options: ["protocol"])
             let name = try args.machineName()
             let machine = try store.load(name)
-            guard runtimeIsLocked(try store.directory(name)) else { throw Failure("VM '\(name)' is stopped. Start it with: terminal-mac start \(name)") }
+            guard try runtimeIsLocked(store.directory(name)) else { throw Failure("VM '\(name)' is stopped. Start it with: terminal-mac start \(name)") }
             let viewer = try TerminalViewer(directory: store.directory(name), machine: machine, graphics: args.options["protocol"], readOnly: args.flags.contains("read-only"))
             try await viewer.run()
         case "guest":
@@ -165,20 +228,31 @@ final class CLI {
         try await Mailbox(store.directory(name).appendingPathComponent("host-control")).call(Request(action: action, arguments: arguments, timeout: timeout))
     }
     func action(_ input: [String]) async throws {
-        let args = try Arguments(input, flags: ["double"], options: ["x", "y", "x2", "y2", "dx", "dy", "text", "key", "button", "count", "output", "timeout"])
-        let actions: Set<String> = ["status", "screenshot", "snapshot", "click", "move", "drag", "scroll", "type", "key"]
-        var positions = args.positionals
-        let name: String
-        if let first = positions.first, actions.contains(first) { name = "default" }
-        else { guard !positions.isEmpty else { throw Failure("Usage: terminal-mac action [NAME] screenshot|click|type|key|scroll|status") }; name = positions.removeFirst() }
-        try validateName(name)
-        _ = try store.load(name)
-        guard !positions.isEmpty, actions.contains(positions[0]) else { throw Failure("Unknown or missing guest action") }
-        let verb = positions.removeFirst()
+        // Diagnostics opt-in never copies error text or input operands. Respect
+        // '--' so literal payload cannot enable an option accidentally.
+        let structured = input.prefix(while: { $0 != "--" }).contains("--structured-errors")
+        var dispatched = false
+        var diagnosticPhase = "validation"
+        do {
+        let args = try Arguments(input, flags: ["double", "structured-errors"], options: ["vm", "x", "y", "x2", "y2", "dx", "dy", "text", "key", "button", "count", "output", "timeout", "owner", "terminal-proof", "terminal-pid", "terminal-window", "service-command", "service-run", "service-nonce", "service-operation", "service-sequence", "service-manifest", "service-acceptance"])
+        let target = try GuestActionTarget(positionals: args.positionals, explicitName: args.options["vm"])
+        let name = target.name, verb = target.verb
+        let requestedKey = try TerminalInputContract.resolvedKey(
+            verb: verb, option: args.options["key"], operands: target.operands)
+        let wireVerb = try TerminalInputContract.wireAction(verb, proof: args.options["terminal-proof"],
+            pid: args.options["terminal-pid"], window: args.options["terminal-window"], key: requestedKey)
+        var positions = target.operands
         var parameters = args.options
         parameters.removeValue(forKey: "output"); parameters.removeValue(forKey: "timeout")
-        if verb == "type", !positions.isEmpty { parameters["text"] = positions.joined(separator: " "); positions.removeAll() }
-        if verb == "key", positions.count == 1 { parameters["key"] = positions.removeFirst() }
+        parameters.removeValue(forKey: "vm"); parameters.removeValue(forKey: "owner")
+        if let proof = parameters.removeValue(forKey: "terminal-proof") { parameters["terminalProof"] = proof }
+        if let pid = parameters.removeValue(forKey: "terminal-pid") { parameters["terminalPID"] = pid }
+        if let window = parameters.removeValue(forKey: "terminal-window") { parameters["terminalWindow"] = window }
+        if ["type", "terminal-type", "clipboard-paste"].contains(verb), !positions.isEmpty { parameters["text"] = positions.joined(separator: " "); positions.removeAll() }
+        if ["key", "terminal-key"].contains(verb), !positions.isEmpty {
+            parameters["key"] = requestedKey
+            positions.removeAll()
+        }
         if ["click", "move"].contains(verb), positions.count == 2 { parameters["x"] = positions.removeFirst(); parameters["y"] = positions.removeFirst() }
         if verb == "drag", positions.count == 4 {
             for key in ["x", "y", "x2", "y2"] { parameters[key] = positions.removeFirst() }
@@ -186,11 +260,41 @@ final class CLI {
         guard positions.isEmpty else { throw Failure("Unexpected action arguments") }
         if args.flags.contains("double") { parameters["double"] = "true" }
         let timeout = try args.integer("timeout", default: 15, range: 1...120)
-        let mailbox = try Mailbox(store.directory(name).appendingPathComponent("exchange"))
-        let request = Request(action: verb, arguments: parameters, timeout: Double(timeout))
+        if verb == "terminal-open", !parameters.isEmpty { throw OutcomeFailure("TERMINAL_GUARD_INVALID", outcome: .noEffect) }
+        let serviceOptions = ["service-command": "serviceCommand", "service-run": "serviceRun",
+                              "service-nonce": "serviceNonce", "service-operation": "serviceOperation",
+                              "service-sequence": "serviceSequence", "service-manifest": "serviceManifest", "service-acceptance": "serviceAcceptance"]
+        if verb == "app-service" {
+            for (option, wire) in serviceOptions {
+                if let value = parameters.removeValue(forKey: option) { parameters[wire] = value }
+            }
+            if let owner = args.options["owner"] { parameters["leaseOwner"] = owner }
+            _ = try AppServiceCommand(arguments: parameters)
+        } else if serviceOptions.keys.contains(where: { args.options[$0] != nil }) {
+            throw AppServiceContract.refuse("APP_SERVICE_INVALID")
+        }
+        let readOnlyServiceObservation = verb == "app-service" && parameters["serviceCommand"] == "observe"
+        diagnosticPhase = "admission"
+        _ = try store.load(name)
+        let directory = try store.directory(name)
+        let mailbox = try Mailbox(directory.appendingPathComponent("exchange"))
+        let request = Request(action: wireVerb, arguments: parameters, timeout: Double(timeout))
         let imageName = "image-\(request.id.uuidString).png"
         defer { mailbox.remove(imageName) }
-        let reply = try await mailbox.call(request)
+        if verb == "screenshot" || verb == "snapshot" { try mailbox.prepareSlot(imageName) }
+        let reply: Reply
+        if readOnlyServiceObservation || ["status", "screenshot", "snapshot"].contains(verb) {
+            diagnosticPhase = "dispatch"; dispatched = true
+            reply = try await mailbox.call(request)
+        } else {
+            let custody = try GuestInputCustody.begin(directory: directory, mailbox: mailbox,
+                request: request, claimedOwner: args.options["owner"])
+            reply = try await custody.perform {
+                diagnosticPhase = "dispatch"; dispatched = true
+                return try await mailbox.call(request)
+            }
+        }
+        diagnosticPhase = "output"
         var values = reply.values
         if verb == "screenshot" || verb == "snapshot" {
             guard values["image"] == imageName, let png = try mailbox.read(imageName, limit: 32 * 1024 * 1024) else { throw Failure("Invalid guest image response") }
@@ -199,6 +303,15 @@ final class CLI {
             values["image"] = output.path
         }
         try printJSON(values)
+        } catch {
+            guard structured else { throw error }
+            let diagnostic = ActionFailureDiagnostic(error: error, dispatched: dispatched, phase: diagnosticPhase)
+            let data = try JSONEncoder().encode(diagnostic)
+            print(String(decoding: data, as: UTF8.self))
+            // The top-level CLI handler must not echo a possibly sensitive
+            // original error after the sanitized envelope has been emitted.
+            throw Failure("ACTION_FAILED")
+        }
     }
     /// The agent skill shipped inside the app bundle, so its instructions match this version.
     /// Development builds outside a bundle fall back to the repository copy.
@@ -223,13 +336,52 @@ final class CLI {
         }
         return executableURL.path
     }
-    func runtimeIsLocked(_ directory: URL) -> Bool { Self.isRunning(directory) }
-    static func isRunning(_ directory: URL) -> Bool {
-        let fd = open(directory.appendingPathComponent("runtime.lock").path, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
-        guard fd >= 0 else { return false }
-        defer { close(fd) }
-        if flock(fd, LOCK_EX | LOCK_NB) == 0 { flock(fd, LOCK_UN); return false }
-        return true
+    /// Opt-in: request a normal guest shutdown, then press only the system's own
+    /// confirmation button once if the guest is still waiting. Never forces,
+    /// never retries the press, and refuses while guest input is held or fenced.
+    func stopConfirmingGuestDialog(_ name: String) async throws -> [String: String] {
+        let directory = try store.directory(name)
+        func state() async throws -> String {
+            guard try runtimeIsLocked(directory) else { return "stopped" }
+            do { return try await host(name, action: "status").values["state"] ?? "unknown" }
+            catch {
+                // The runtime can exit while answering: its released lock is the stop.
+                if !(try runtimeIsLocked(directory)) { return "stopped" }
+                throw error
+            }
+        }
+        func waitStopped(seconds: Int) async throws -> String {
+            for _ in 0..<seconds {
+                let current = try await state()
+                if current == "stopped" { return current }
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            return try await state()
+        }
+        var current = try await state()
+        guard current != "stopped" else { return ["state": "stopped", "guestDialogConfirmed": "false"] }
+        if current == "running" {
+            _ = try await host(name, action: "stop", arguments: ["force": "false"])
+        }
+        current = try await waitStopped(seconds: 10)
+        guard current != "stopped" else { return ["state": "stopped", "guestDialogConfirmed": "false"] }
+        let mailbox = try Mailbox(directory.appendingPathComponent("exchange"))
+        var confirmed = "unconfirmed"
+        do {
+            _ = try await GuestStopConfirmation.attempt(directory: directory, mailbox: mailbox,
+                runtimeStatus: { try await self.host(name, action: "status").values },
+                guest: { try await mailbox.call($0) })
+            confirmed = "true"
+        } catch {
+            guard try await waitStopped(seconds: 60) == "stopped" else { throw error }
+            return ["state": "stopped", "guestDialogConfirmed": "unconfirmed-reply"]
+        }
+        let final = try await waitStopped(seconds: 60)
+        return ["state": final, "guestDialogConfirmed": confirmed]
+    }
+    func runtimeIsLocked(_ directory: URL) throws -> Bool { try Self.isRunning(directory) }
+    static func isRunning(_ directory: URL) throws -> Bool {
+        try RuntimeLock.isHeld(in: directory)
     }
     static let help = """
     terminal-mac — a separate macOS desktop for computer-use agents
@@ -252,19 +404,47 @@ final class CLI {
     show|hide [NAME]             Show or hide the native VM window
     status|pause|resume [NAME]   Manage the VM
     stop [NAME] [--force]        Request guest shutdown (or immediately power off)
+    stop [NAME] --confirm-guest-dialog  Opt-in: also press macOS's own Shut Down confirmation once
     ls                          List installed VMs as JSON
     doctor                      Check host support and bundled guest tools
+    rename OLD NEW              Rename a stopped VM, preserving identity and guest data
+    clone OLD NEW [--offline]   Clone a stopped VM with a fresh identity; optionally disable its network
+    lease NAME status           Report which client currently owns guest input
 
-    action [NAME] status
-    action [NAME] screenshot [--output PATH]
-    action [NAME] click X Y [--button right] [--double]
-    action [NAME] move X Y
-    action [NAME] drag X Y X2 Y2
-    action [NAME] type 'text'
-    action [NAME] key cmd+space
-    action [NAME] scroll --dy -300 [--dx 0 --x 640 --y 400]
+    clipboard NAME copy|paste    Transfer selected guest text to host, or paste host text in guest
+    action --vm NAME status
+    action --vm NAME screenshot [--output PATH]
+    action --vm NAME click X Y [--button right] [--double]
+    action --vm NAME move X Y
+    action --vm NAME drag X Y X2 Y2
+    action --vm NAME type 'text'
+    action --vm NAME key cmd+space
+    action --vm NAME scroll --dy -300 [--dx 0 --x 640 --y 400]
+    action --vm NAME clipboard-copy|clipboard-paste [--text TEXT]
+    action --vm NAME app-service --service-command open|install|observe|launch|activate|quit|close
+      --service-run run-<32hex> --service-nonce <64hex> --service-operation <uuid>
+      --service-sequence N --service-manifest <64hex> --service-acceptance <64hex> --owner OWNER
+      Native helper v2: create-only guest /Applications/APP.app; no replacement,
+      privileged installer, staged scripts, commands, or environment overrides.
+      Signed-code integrity is checked without changing Gatekeeper or TCC.
+      Payload digests are not publisher authentication, notarization, or live QA.
+    action --vm NAME terminal-open     Launch only the guest's system Terminal app
+    action --vm NAME type|key ... --terminal-proof terminal-input/2 --terminal-pid PID --terminal-window TOKEN
+      Guarded input uses distinct wire verbs; a legacy helper cannot ignore the guard.
+      Terminal UI focus is not shell-prompt readiness. --structured-errors emits safe JSON errors.
+      Legacy action NAME ACTION and default-target ACTION remain supported
+      when unambiguous. Verb-named VMs and verb-like text require explicit syntax.
 
-    mcp [NAME]                  MCP server (stdio) with computer-use tools for agents:
+    mcp [NAME]                  MCP server (stdio) with computer-use tools
+      [--app-run run-<32hex> --app-manifest <64hex> --app-acceptance <64hex>]
+      Optional, all-or-none: start one already accepted guest application under
+      the SAME MCP input lease. Requires live read-only VZ artifacts, helper
+      app-service/4 and launch-identity/1, guest permissions, and exact staged
+      acceptance. No generic command, app path, script, or second lease.
+      READY_FOR_AGENT requires a bound GUI primary with foreground AX window.
+      Session budget is 600s, with 120s reserved for normal Quit/close on EOF.
+      Unknown outcomes retain fences and prohibit further guest mutations.
+      --config cannot be combined with app bootstrap flags. for agents:
                                 claude mcp add terminal-mac -- terminal-mac mcp
       [--config]                Print an mcpServers entry for Cursor, VS Code, Codex…
     skills get|path|install     The agent skill for this version; install copies it

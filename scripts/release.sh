@@ -17,7 +17,7 @@ case "$mode" in
   local) export SIGN_IDENTITY=- ;;
   public)
     export SIGN_IDENTITY="${SIGN_IDENTITY:-$SIGNING_NAME}"
-    security find-identity -p codesigning | grep -qF "\"$SIGN_IDENTITY\"" || { echo "No \"$SIGN_IDENTITY\" identity. Run scripts/create-signing-identity.sh, or restore your backup of it." >&2; exit 1; } ;;
+    security find-identity -p codesigning ${SIGN_KEYCHAIN:+"$SIGN_KEYCHAIN"} | grep -qF "\"$SIGN_IDENTITY\"" || { echo "No \"$SIGN_IDENTITY\" identity. Run scripts/create-signing-identity.sh, or restore your backup of it." >&2; exit 1; } ;;
   notarized)
     if [[ -z "${SIGN_IDENTITY:-}" ]]; then
       SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Developer ID Application: .*\)"$/\1/p' | head -1)"

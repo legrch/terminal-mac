@@ -12,7 +12,7 @@ let package = Package(
         .executableTarget(name: "TerminalMac", dependencies: ["TerminalMacCore", "TerminalUI", "CPhoneShim"],
             linkerSettings: [.linkedFramework("Virtualization"), .linkedFramework("AppKit"),
                              .linkedFramework("ScreenCaptureKit"), .linkedFramework("ApplicationServices"), .linkedFramework("ServiceManagement"), .linkedFramework("CoreMedia")]),
-        .testTarget(name: "TerminalMacCoreTests", dependencies: ["TerminalMacCore"])
+        .testTarget(name: "TerminalMacCoreTests", dependencies: ["TerminalMacCore", "TerminalMac"])
     ],
     swiftLanguageModes: [.v5]
 )

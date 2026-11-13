@@ -136,7 +136,32 @@ The automounted volume is supplied by macOS virtio-fs. If it is absent, check th
 ./dist/terminal-mac action default scroll --dy -300 --x 640 --y 400
 ```
 
+Use `action --vm NAME ACTION` when selecting a VM explicitly, especially if its
+name is also an action verb. For example, `action --vm clipboard-paste status`
+reads that VM's status. The ambiguous legacy form `action clipboard-paste status`
+is rejected; it must never paste into `default`. Existing unambiguous forms such
+as `action pilot status`, `action status`, and `action type 'hello'` still work.
+For verb-like text, use `action --vm default type status` or
+`action type --text status`. Target selection never depends on which VMs exist.
+
 Commands return JSON and a nonzero exit status on failure. Screenshots return a local host PNG path. Coordinates start at the top-left and match the screenshot's dimensions; screenshots use guest display points to keep input coordinates consistent on Retina displays. `snapshot` is currently a screenshot alias, not an accessibility-tree snapshot.
+
+Guest input uses a cooperative lease. While a viewer, an MCP agent or a product scenario
+holds it, other clients are refused; a holder can use `action --owner <token>` for its own
+actions. `terminal-mac lease NAME status` also reports `state: unresolved-predecessor` and
+`inputAllowed: false` when the kernel lock is free but prior custody evidence remains. A
+`held: false` response alone does not authorize input: consumers must inspect the state.
+Retained or unreadable evidence must be reconciled, not removed automatically. The updated
+guest helper defers self-replacement while a marker exists, even after expiry. These checks
+do not authenticate the owner token. Standalone mutations acquire custody through dispatch;
+cooperative owner calls also publish a durable `input-operation.json` fence before effects.
+Unknown results retain that fence and both custody records for explicit reconciliation,
+including when the original holder exits. Cooperative calls require the holder's
+existing helper-update marker and cannot reopen admission after teardown begins.
+A closing holder publishes `input-closing.json` while an operation is outstanding;
+confirmed completion reconciles only the original metadata inode and bytes under
+the shared admission lock. Unknown completion retains all evidence. Older installed helpers and clients require
+separate compatibility verification.
 
 The agent instructions are in [docs/AGENT.md](docs/AGENT.md). No global agent settings are modified.
 
@@ -152,28 +177,71 @@ The agent instructions are in [docs/AGENT.md](docs/AGENT.md). No global agent se
 ./dist/terminal-mac stop default --force  # immediate power-off; unsaved guest work can be lost
 ```
 
-Customize a new VM with `--cpus 4 --memory 4 --disk 64 --width 1280 --height 800` (width and height are in points; add `--standard` for a 1x display). CPU, memory and disk arguments are logical CPUs, GiB and GiB respectively. `--offline` omits the guest network device; the shared-folder control channel still works, though some macOS setup workflows may require networking.
+Customize a new VM with `--cpus 4 --memory 4 --disk 64 --width 1280 --height 800` (width and height are in points; add `--standard` for a 1x display). CPU, memory and disk arguments are logical CPUs, GiB and GiB respectively. `--offline` omits the guest network device; the shared-folder control channel still works, though some macOS setup workflows may require networking. Rename a stopped machine with `terminal-mac rename OLD NEW`: one atomic same-volume move that preserves identity, disks, auxiliary storage and guest data, refuses running machines, held input leases and collisions, records the old→new mapping in `rename.json`, and detects a half-finished earlier rename instead of adopting it.
 
 VM data lives in `~/Library/Application Support/terminal-mac/machines/NAME/`. `TERMINAL_MAC_HOME` overrides the data root. Each VM has an exclusive file lock, a sparse disk, hardware identity, auxiliary boot storage, `machine.json`, a private host-control mailbox, the guest exchange directory, and `runtime.log`. A VM boot runs as a separate background process. Lifecycle commands must use the same `TERMINAL_MAC_HOME` as the process that started it.
 
 An interrupted or failed installation leaves its directory and `installed: false` for diagnosis. It is never silently overwritten. To retry, ensure no installer/VM is running, move that incomplete directory aside, then create the VM again. There is deliberately no destructive VM-delete command yet.
 
+## Text clipboard between host and guest
+
+The native VM window leaves system shortcuts such as **Cmd+Tab** with the host, so you can switch out of the VM normally.
+
+In the native VM window, **Cmd+V** pastes the host clipboard into the focused guest field;
+**Cmd+C** copies the selected guest text to the host clipboard. The guest helper must be
+running with Accessibility permission. Only plain text up to 32 KiB is supported; files,
+images and rich formatting are not transferred. A failed or empty guest copy keeps the
+host clipboard unchanged before a host write is attempted. Paste captures the text when
+the command is received, before waiting in an input queue; Copy checks the initiating
+host clipboard revision again immediately before writing. This is not an atomic
+conditional write: another process can still race that local OS operation. Native
+shortcut errors beep and appear in the VM runtime log. Native clipboard transfers
+acquire their own input lease and are refused while any viewer, MCP agent or scenario
+holds it, including an owner that deliberately opened the native window.
+
+In the terminal viewer, **Ctrl+G**, then **V** pastes host text; **Ctrl+G**, then **C** copies
+selected guest text to the host. Command-line equivalents:
+
+```sh
+terminal-mac clipboard pilot paste
+terminal-mac clipboard pilot copy
+```
+
+Cut remains guest-only. After guest **Cmd+X**, use **Control+Cmd+V** in the native
+window, or **Ctrl+G**, then **P** in the terminal viewer, to paste the guest clipboard
+without replacing it with host text. The ordinary host Paste route does not complete a
+guest-only Cut. Keep guest focus/input and other guest clipboard writers idle until an
+asynchronous transfer completes. The global guest clipboard cannot attest which app
+produced an intervening update. A local OS pasteboard write failure can occur after the
+previous destination contents have been cleared; this is reported as a transfer error.
+
+Transfers happen only when requested and overwrite the destination clipboard. Clipboard
+contents are not printed by these commands. `action pilot clipboard-paste 'text'` and
+`action pilot clipboard-copy` are guest-only protocol actions; the latter returns text.
+Never use a paste into a shell unless you intend the copied text to be interpreted there.
+
+After building an updated helper, open `/Volumes/My Shared Files/tools/TerminalMacGuest.app`
+inside the guest. Existing guest macOS permission prompts may need confirmation. A VM
+runtime already running the old host executable needs a normal guest shutdown and start
+to enable native-window shortcuts; CLI transfers use the new binary immediately once the
+updated guest helper is running. Do not force-stop a guest with unsaved work.
+
 ## Isolation model
 
 - Host input and screen APIs are not used for agent actions. The helper refuses to run unless `hw.model` starts with `VirtualMac`. That check prevents accidental host execution; it is not hardware attestation or a defense against a compromised host.
-- The guest sees two explicit shares: `control` (read/write, containing request/reply JSON and screenshots) and `tools` (read-only helper app). Host home, project folders, clipboard, microphone, and camera are not attached.
+- The guest sees three explicit shares: `control` (read/write, containing request/reply JSON and screenshots) `tools` (read-only helper app), and `artifacts` (private per-machine read-only inbox). Artifact staging lives under the VM data directory, never inside the signed app bundle. Host home, project folders, microphone, and camera are not attached. Clipboard text crosses only on an explicit Copy/Paste action; neither clipboard is polled or mirrored.
 - There is no remote-control network listener. The flat mailbox pins its directory, rejects symlinks, hardlinks and nonregular files on reads, bounds message sizes, checks request IDs, and expires pending actions. The host never executes guest-provided content.
-- Default NAT networking permits guest internet access and may reach services on the host or local network. This is **not** a network-isolated or hardened hostile-code environment. `--offline` removes that network path.
+- Default NAT networking permits guest internet access and may reach services on the host or local network. This is **not** a network-isolated or hardened hostile-code environment. `--offline` configures no NAT device; verify the running guest separately before claiming isolation.
 - A logged-out/locked guest, missing helper, denied guest permissions, or paused VM prevents normal computer use. TCC grants are interactive guest setup, not bypassed by the CLI.
 
-VM cloning, rollback checkpoints, accessibility snapshots, fully unattended guest setup, terminal splits and tmux transport remain future work. The native Virtualization framework does not itself render a Mac into a terminal or offer an agent input API; this project supplies the guest transport and terminal presentation layers.
+Rollback checkpoints, accessibility snapshots, fully unattended guest setup, terminal splits and tmux transport remain future work. The native Virtualization framework does not itself render a Mac into a terminal or offer an agent input API; this project supplies the guest transport and terminal presentation layers.
 
 ## Development and validation
 
 ```sh
 CLANG_MODULE_CACHE_PATH=/tmp/terminal-mac-modules \
 SWIFTPM_MODULECACHE_OVERRIDE=/tmp/terminal-mac-modules \
-swift test --disable-sandbox --scratch-path /tmp/terminal-mac-build \
+swift test --scratch-path /tmp/terminal-mac-build \
   --cache-path /tmp/terminal-mac-cache \
   --config-path /tmp/terminal-mac-config --security-path /tmp/terminal-mac-security
 ```

@@ -12,7 +12,15 @@ import UniformTypeIdentifiers
 final class AgentServer {
     let store: Store
     let name: String
-    init(store: Store, name: String) { self.store = store; self.name = name }
+    /// Sticky for this session. A crash also leaves the original marker behind.
+    private var outcomeGuard = GuestSessionOutcomeGuard()
+    let sessionOwner = "mcp:" + UUID().uuidString.lowercased()
+    private var guestActionInFlight = false
+    private let appSelection: AppMCPSelection?
+    private var appSession: AppServiceMCPSession?
+    init(store: Store, name: String, appSelection: AppMCPSelection? = nil) {
+        self.store = store; self.name = name; self.appSelection = appSelection
+    }
 
     static let instructions = """
     Controls a separate virtual Mac, not the user's own desktop. Call `screenshot` first; every \
@@ -47,6 +55,58 @@ final class AgentServer {
     ]
 
     func run() async throws {
+        // InputLease.acquire creates its directories. Validate the selected machine
+        // first so an early MCP launch cannot obstruct normal first-use creation.
+        _ = try store.load(name)
+        // The MCP agent owns guest input while it serves; a competing viewer or scenario is
+        // refused at startup instead of interleaving guest actions.
+        let lease = try InputLease.acquire(directory: try store.directory(name), owner: sessionOwner,
+                                           generation: Int(Date().timeIntervalSince1970))
+        // A long-lived MCP server may be idle longer than the 120-second marker TTL.
+        // Publish at acquisition, not only on the next tool request. The new helper
+        // treats expiry as an inhibitor; no heartbeat/timer is needed for update safety.
+        var markerPublished = false
+        let updateBox = try? Mailbox(store.directory(name).appendingPathComponent("exchange"), create: true)
+        defer {
+            var cleanMarkerRelease = false
+            if markerPublished && !outcomeGuard.isUnconfirmed && !guestActionInFlight &&
+                (appSession?.permitsCleanRelease ?? true), let updateBox {
+                do {
+                    try updateBox.releaseLeaseFlag(ownedBy: sessionOwner)
+                    cleanMarkerRelease = true
+                } catch { /* Keep both records for reconciliation. */ }
+            }
+            // Acquisition already checked predecessor metadata and the marker under flock.
+            // A failed initialization, unresolved guest effect or failed marker release must
+            // preserve this session's machine metadata too; unlock is NOT effect completion.
+            lease.release(preserveMetadata: !cleanMarkerRelease)
+        }
+        guard let updateBox else { throw Failure("Cannot open guest exchange for helper-update custody") }
+        // Defence in depth: refuse a marker newly published after acquisition. Only the
+        // pre-publication check inside InputLease.acquire protects predecessor metadata.
+        try updateBox.requireNoOutstandingUpdateMarker()
+        // Native app-service has a fixed 600s lifetime; publish ONE marker
+        // with the SAME immutable owner and no timer-based renewal. Generic MCP
+        // retains its original 120s behavior.
+        try updateBox.publishLeaseFlag(owner: sessionOwner,
+                                       ttl: appSelection == nil ? 120 : AppMCPAdmission.budget)
+        markerPublished = true
+        if let selection = appSelection {
+            let accepted = AppServiceMCPSession(selection: selection, owner: sessionOwner,
+                                                machineDirectory: try store.directory(name))
+            appSession = accepted
+            do {
+                try await accepted.bootstrap(
+                    host: { request in
+                        try await Mailbox(try self.store.directory(self.name)
+                            .appendingPathComponent("host-control")).call(request)
+                    },
+                    guest: { request in try await self.guest(request) })
+            } catch {
+                if accepted.hasIntent { outcomeGuard.markUnconfirmed() }
+                throw error
+            }
+        }
         for try await line in FileHandle.standardInput.bytes.lines {
             guard let data = line.data(using: .utf8), let message = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 send(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "Parse error"]]); continue
@@ -71,6 +131,22 @@ final class AgentServer {
             default: send(["jsonrpc": "2.0", "id": id, "error": ["code": -32601, "message": "Method not found"]])
             }
         }
+        // Reaching this point is a clean stdio EOF. A crash, thrown stream
+        // read or transport interruption does NOT enter native Quit/close.
+        if let accepted = appSession {
+            // A prior GUI action may have an UNKNOWN outcome independent of
+            // the native app-service sequence. Do not even attempt cleanup
+            // dispatch in that state; the original marker remains retained.
+            guard !outcomeGuard.isUnconfirmed else {
+                throw Failure("MCP guest outcome is unconfirmed; no EOF cleanup dispatched")
+            }
+            do {
+                try await accepted.cleanEOF(guest: { request in try await self.guest(request) })
+            } catch {
+                outcomeGuard.markUnconfirmed()
+                throw error
+            }
+        }
     }
 
     private func call(_ tool: String, _ a: [String: Any]) async throws -> [[String: Any]] {
@@ -87,12 +163,17 @@ final class AgentServer {
             return value
         }
         var requests: [Request] = []
+        if tool != "screenshot" && tool != "status", let accepted = appSession {
+            try accepted.requireInteractiveBudget()
+        }
         switch tool {
         case "screenshot": return try await screenshot()
         case "status":
             let reply = try await guest(Request(action: "status", timeout: 5))
             let summary = reply.values.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)" }.joined(separator: "\n")
-            return [["type": "text", "text": "VM '\(name)' is running.\n" + summary]]
+            let appState = appSession.map { "\n" + $0.summary() } ?? ""
+            let custody = outcomeGuard.isUnconfirmed ? "\nGuest input outcome: UNKNOWN; only status/screenshot allowed." : ""
+            return [["type": "text", "text": "VM '\(name)' is running.\n" + summary + appState + custody]]
         case "click":
             var base = ["x": try int("x"), "y": try int("y")]
             if a["button"] as? String == "right" { base["button"] = "right" }
@@ -127,6 +208,7 @@ final class AgentServer {
         let request = Request(action: "screenshot", timeout: 15)
         let imageName = "image-\(request.id.uuidString).png"
         defer { mailbox.remove(imageName) }
+        try mailbox.prepareSlot(imageName)
         let reply = try await guest(request, mailbox: mailbox)
         guard reply.values["image"] == imageName, let png = try mailbox.read(imageName, limit: 64 * 1024 * 1024),
               let source = CGImageSourceCreateWithData(png as CFData, nil), let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
@@ -141,17 +223,39 @@ final class AgentServer {
     }
 
     private func exchange() throws -> Mailbox { try Mailbox(store.directory(name).appendingPathComponent("exchange")) }
-    private func guest(_ request: Request, mailbox: Mailbox? = nil) async throws -> Reply {
+    func guest(_ request: Request, mailbox: Mailbox? = nil) async throws -> Reply {
+        let observation = ["status", "screenshot"].contains(request.action) ||
+            (request.action == "app-service" && request.arguments["serviceCommand"] == "observe")
+        if !observation { try outcomeGuard.requireAllowed(action: request.action) }
         try requireRunning()
-        return try await (mailbox ?? exchange()).call(request)
+        let box: Mailbox
+        if let mailbox { box = mailbox } else { box = try exchange() }
+        // Every mutation, including app-service bootstrap and EOF Quit/close,
+        // borrows through the same durable fence as cooperative CLI calls.
+        // Admission errors issue no request and do not reclassify any outcome.
+        let custody = observation ? nil : try GuestInputCustody.begin(
+            directory: store.directory(name), mailbox: box, request: request, claimedOwner: sessionOwner)
+        guestActionInFlight = true
+        defer { guestActionInFlight = false }
+        do {
+            if let custody { return try await custody.perform { try await box.call(request) } }
+            return try await box.call(request)
+        } catch {
+            if let failure = error as? OutcomeFailure,
+               failure.outcome == .noEffect || failure.outcome == .confirmedNoCopy {
+                throw error
+            }
+            outcomeGuard.markUnconfirmed()
+            throw error
+        }
     }
-    /// Checked per call, so the server starts (and lists its tools) before any VM exists.
+    /// Running state is checked per call; existence is validated before acquiring custody.
     private func requireRunning() throws {
         guard (try? store.load(name)) != nil else {
             throw Failure("No virtual Mac named '\(name)' exists yet. Ask the user to run `terminal-mac up\(name == "default" ? "" : " " + name)`; it downloads macOS and needs them for first-time setup.")
         }
         let directory = try store.directory(name)
-        guard CLI.isRunning(directory) else { throw Failure("VM '\(name)' is stopped. Ask the user to run: terminal-mac start \(name)") }
+        guard try CLI.isRunning(directory) else { throw Failure("VM '\(name)' is stopped. Ask the user to run: terminal-mac start \(name)") }
     }
     private func explain(_ error: Error) -> String {
         if let timeout = error as? MailboxTimeout, !timeout.pickedUp {

@@ -4,6 +4,69 @@ import Darwin
 @testable import TerminalMacCore
 
 final class CoreTests: XCTestCase {
+    func testArtifactShareIsPrivateAndRejectsAliasesAndFiles() throws {
+        let manager = FileManager.default
+        guard let physical = realpath(testTemporaryDirectory.path, nil) else { throw Failure("Cannot resolve disposable test directory") }
+        defer { free(physical) }
+        let root = URL(fileURLWithPath: String(cString: physical)).appendingPathComponent(UUID().uuidString)
+        try manager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? manager.removeItem(at: root) }
+        let share = try ArtifactShareDirectory.prepare(in: root)
+        XCTAssertEqual(share.lastPathComponent, "artifacts")
+        XCTAssertEqual(try ArtifactShareDirectory.prepare(in: root), share)
+        let probe = share.appendingPathComponent(ArtifactShareDirectory.probeName)
+        XCTAssertEqual(try Data(contentsOf: probe), ArtifactShareDirectory.probeBytes)
+        XCTAssertThrowsError(try AppServiceDirectory.open(share).requireReadOnlyVolume(), "Writable APFS must never qualify as read-only")
+        try Data("tampered".utf8).write(to: probe)
+        XCTAssertThrowsError(try ArtifactShareDirectory.prepare(in: root))
+        try manager.removeItem(at: share)
+        try manager.createSymbolicLink(at: share, withDestinationURL: root)
+        XCTAssertThrowsError(try ArtifactShareDirectory.prepare(in: root))
+        try manager.removeItem(at: share)
+        try Data("not a directory".utf8).write(to: share)
+        XCTAssertThrowsError(try ArtifactShareDirectory.prepare(in: root))
+    }
+
+    func testClipboardShortcutsUsePhysicalPositionsAndExplicitGuestPaste() {
+        // The same C/V positions must work under Latin and Cyrillic input sources;
+        // layout characters, Caps Lock and Fn are deliberately absent from the resolver.
+        XCTAssertEqual(ClipboardShortcut.resolve(keyCode: 8, command: true), .copy)
+        XCTAssertEqual(ClipboardShortcut.resolve(keyCode: 9, command: true), .paste)
+        XCTAssertNil(ClipboardShortcut.resolve(keyCode: 9, command: false))
+        XCTAssertNil(ClipboardShortcut.resolve(keyCode: 9, command: true, shift: true))
+        XCTAssertEqual(ClipboardShortcut.resolve(keyCode: 9, command: true, control: true), .pasteGuest)
+        XCTAssertNil(ClipboardShortcut.resolve(keyCode: 8, command: true, control: true))
+        XCTAssertNil(ClipboardShortcut.resolve(keyCode: 9, command: true, option: true))
+        XCTAssertNil(ClipboardShortcut.resolve(keyCode: 48, command: true))
+    }
+
+    func testClipboardTransferBindsTheInitiatingValueAndPreservesNewerCopy() throws {
+        var clipboard = "authorized A"
+        let queued = try ClipboardTransfer.pasteRequest(clipboard, expectedRevision: 10, currentRevision: 10)
+        clipboard = "later private B"
+        XCTAssertEqual(queued.arguments["text"], "authorized A")
+        XCTAssertNotEqual(queued.arguments["text"], clipboard)
+        XCTAssertEqual(queued.action, "clipboard-paste")
+        XCTAssertThrowsError(try ClipboardTransfer.pasteRequest(clipboard, expectedRevision: 10, currentRevision: 11))
+        XCTAssertThrowsError(try ClipboardTransfer.copyText("guest", expectedRevision: 10, currentRevision: 11))
+        XCTAssertEqual(try ClipboardTransfer.copyText("guest", expectedRevision: 10, currentRevision: 10), "guest")
+        for value: String? in [nil, "", String(repeating: "🌍", count: 8193)] {
+            XCTAssertThrowsError(try ClipboardTransfer.guestCopyText(value))
+        }
+        XCTAssertEqual(try ClipboardTransfer.guestCopyText(" \n"), " \n")
+        XCTAssertEqual(try ClipboardTransfer.guestCopyText(String(repeating: "🌍", count: 8192)).utf8.count, 32768)
+    }
+
+    func testCollectedRequestMustStillBeLiveAtExecution() async throws {
+        let request = Request(action: "clipboard-paste", arguments: ["text": "synthetic"], timeout: 5)
+        XCTAssertNoThrow(try request.requireLive(at: request.deadline.addingTimeInterval(-0.1)))
+        XCTAssertThrowsError(try request.requireLive(at: request.deadline))
+        let mailbox = try Mailbox(temporary())
+        let expired = Request(action: "clipboard-paste", arguments: ["text": "synthetic"], timeout: -1)
+        do { _ = try await mailbox.call(expired); XCTFail("Expected expiry before publication") } catch {}
+        XCTAssertNil(try mailbox.read("request-\(expired.id.uuidString).json"))
+    }
+
     func testFirstRunPlansSkipDownloadAndInstallForExistingMacs() {
         let machine = Machine(name: "work", cpu: 4, memoryGiB: 4, diskGiB: 64, installed: true)
         XCTAssertEqual(SetupPlan(name: "work", machine: machine, hasLocalImage: false).steps,
@@ -36,7 +99,7 @@ final class CoreTests: XCTestCase {
         XCTAssertThrowsError(try FileLock(link))
     }
     func temporary() throws -> URL {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("terminal-mac-tests-\(UUID().uuidString)")
+        let url = testTemporaryDirectory.appendingPathComponent("terminal-mac-tests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: url) }
         return url

@@ -27,6 +27,7 @@ final class TerminalViewer {
         Shortcut(key: "n", label: "New window", chord: "cmd+n", glyph: "⌘N"), Shortcut(key: "w", label: "Close window", chord: "cmd+w", glyph: "⌘W"),
         Shortcut(key: "q", label: "Quit app", chord: "cmd+q", glyph: "⌘Q"), Shortcut(key: "f", label: "Find", chord: "cmd+f", glyph: "⌘F"),
         Shortcut(key: "c", label: "Copy", chord: "cmd+c", glyph: "⌘C"), Shortcut(key: "v", label: "Paste", chord: "cmd+v", glyph: "⌘V"),
+        Shortcut(key: "p", label: "Paste guest clipboard", chord: "guest-paste", glyph: "⌃⌘V"),
         Shortcut(key: "x", label: "Cut", chord: "cmd+x", glyph: "⌘X"), Shortcut(key: "a", label: "Select all", chord: "cmd+a", glyph: "⌘A"),
         Shortcut(key: "z", label: "Undo", chord: "cmd+z", glyph: "⌘Z"), Shortcut(key: ",", label: "Settings", chord: "cmd+,", glyph: "⌘,")
     ]
@@ -38,6 +39,10 @@ final class TerminalViewer {
     let machine: Machine
     let graphics: String
     let readOnly: Bool
+    static let leaseOwner = "viewer"
+    static func recoveryWindowRequest() -> Request {
+        Request(action: "show", arguments: ["leaseOwner": leaseOwner], timeout: 5)
+    }
     private let writer = TerminalWriter()
     private let renderer: DesktopRenderer
     private var metrics = TerminalMetricFilter()
@@ -46,6 +51,9 @@ final class TerminalViewer {
     /// The guest display in points: input coordinates, and the aspect ratio to lay out.
     private var points: (width: Int, height: Int)
     private var failure: Error?
+    /// A failed/abandoned input may still have affected the guest. Keep the
+    /// update inhibitor for reconciliation instead of releasing it on exit.
+    private(set) var guestOutcomeUnconfirmed = false
     private var quit = false, link = Link.connecting, palette = false
     private var queue: [Request] = [], labels: [UUID: String] = [:], inFlight = false
     private var anchor: (x: Int, y: Int, at: Date)?, lastClick: (x: Int, y: Int, at: Date, count: Int)?
@@ -64,7 +72,8 @@ final class TerminalViewer {
     /// Set once a guest helper has answered, so later runs of `up` can skip the native setup window.
     static func readyMarker(_ directory: URL) -> URL { directory.appendingPathComponent("guest-ready") }
 
-    init(directory: URL, machine: Machine, graphics: String?, readOnly: Bool) throws {
+    init(directory: URL, machine: Machine, graphics: String?, readOnly: Bool,
+         requireInteractiveTerminal: Bool = true) throws {
         mailbox = try Mailbox(directory.appendingPathComponent("exchange"))
         host = try Mailbox(directory.appendingPathComponent("host-control"), create: true)
         self.directory = directory; self.machine = machine; self.readOnly = readOnly
@@ -75,8 +84,8 @@ final class TerminalViewer {
         guard let selected = graphics ?? detected, ["kitty", "iterm"].contains(selected) else {
             throw Failure("Use Ghostty, Kitty or iTerm2 for inline graphics, or choose --protocol kitty|iterm. Use 'show' for a native window in other terminals. tmux passthrough is not implemented.")
         }
-        guard isatty(STDIN_FILENO) == 1, isatty(STDOUT_FILENO) == 1 else { throw Failure("view needs an interactive terminal") }
-        if env["TMUX"] != nil { throw Failure("Run view outside tmux for now; graphics passthrough is not implemented") }
+        guard !requireInteractiveTerminal || (isatty(STDIN_FILENO) == 1 && isatty(STDOUT_FILENO) == 1) else { throw Failure("view needs an interactive terminal") }
+        if requireInteractiveTerminal && env["TMUX"] != nil { throw Failure("Run view outside tmux for now; graphics passthrough is not implemented") }
         self.graphics = selected
         // Kitty-protocol terminals start on PNG until they confirm shared memory support.
         renderer = DesktopRenderer(writer: writer, transport: selected == "iterm" ? .iterm : .kittyDirect)
@@ -109,6 +118,34 @@ final class TerminalViewer {
         }
         var frames: Task<Void, Never>?
         defer { frames?.cancel() }
+        // A cancelled/thrown exit may skip the normal frame-task join. Never
+        // clear the update inhibitor until this session has observed its drain.
+        var framesDrained = false
+        // The viewer owns guest input while it runs: other CLI/MCP/scenario clients are refused
+        // until it exits, and the guest helper defers self-replacement while the flag is up.
+        let lease = try InputLease.acquire(directory: directory, owner: Self.leaseOwner, generation: Int(Date().timeIntervalSince1970))
+        var markerPublished = false
+        defer {
+            // A timed-out action or unjoined frame task may outlive this terminal session.
+            // Keep BOTH custody records unless the marker release actually completes.
+            var cleanMarkerRelease = false
+            if ViewerUpdateExitGate.mayReleaseMarker(published: markerPublished,
+                                                    framesDrained: framesDrained,
+                                                    inputInFlight: inFlight,
+                                                    outcomeUnknown: guestOutcomeUnconfirmed) {
+                do {
+                    try mailbox.releaseLeaseFlag(ownedBy: Self.leaseOwner)
+                    cleanMarkerRelease = true
+                } catch { /* Retain both records for reconciliation. */ }
+            }
+            lease.release(preserveMetadata: !cleanMarkerRelease)
+        }
+        // InputLease.acquire checked the predecessor marker under flock before publishing
+        // machine metadata. Re-check here to reject a concurrent out-of-contract publisher.
+        try mailbox.requireNoOutstandingUpdateMarker()
+        try mailbox.publishLeaseFlag(owner: Self.leaseOwner, ttl: 120)
+        markerPublished = true
+        // Expiry remains an update inhibitor, so no uncertain publication is renewed.
         var parser = TerminalInput(), lastInput = Date(), previousSize = "", lastChrome = Date.distantPast
         let started = Date()
         while !quit {
@@ -146,6 +183,7 @@ final class TerminalViewer {
         // Let the current frame request finish so its reply and image are removed.
         quit = true
         await frames?.value
+        framesDrained = failure == nil
         if let failure { throw failure }
     }
 
@@ -163,6 +201,8 @@ final class TerminalViewer {
                                                                       "maxWidth": String(target?.imageWidth ?? 1280), "maxHeight": String(target?.imageHeight ?? 800)],
                                       timeout: link == .login ? 2 : 6)
                 defer { mailbox.remove("image-\(request.id.uuidString).bin"); mailbox.remove("image-\(request.id.uuidString).png") }
+                // Own the image slots so a late helper publish cannot recreate them after cleanup.
+                for suffix in ["bin", "png"] { try? mailbox.prepareSlot("image-\(request.id.uuidString).\(suffix)") }
                 do {
                     let reply = try await mailbox.call(request)
                     if quit { break }
@@ -222,10 +262,14 @@ final class TerminalViewer {
         Task { @MainActor in _ = try? await host.call(Request(action: "hide", timeout: 5)) }
     }
     private func openLoginWindow() {
+        guard !guestOutcomeUnconfirmed else {
+            record("Guest input outcome is unconfirmed; reconcile the original operation first", ok: false)
+            return
+        }
         loginWindow = true
         record("Opened the VM window · it hides once the guest is ready", ok: true)
         Task { @MainActor in
-            do { _ = try await host.call(Request(action: "show", timeout: 5)) }
+            do { _ = try await host.call(Self.recoveryWindowRequest()) }
             catch { loginWindow = false; record("Cannot open the VM window: \(error.localizedDescription)", ok: false) }
         }
     }
@@ -424,7 +468,8 @@ final class TerminalViewer {
     // MARK: Input
 
     /// Input runs one request at a time, in order, without ever blocking drawing or typing.
-    private func enqueue(_ action: String, _ arguments: [String: String], label: String) {
+    func enqueue(_ action: String, _ arguments: [String: String], label: String) {
+        guard !guestOutcomeUnconfirmed else { return }
         if action == "type", let last = queue.last, last.action == "type", let previous = last.arguments["text"],
            previous.utf8.count + (arguments["text"]?.utf8.count ?? 0) < 32768 {
             let text = previous + (arguments["text"] ?? "")
@@ -432,23 +477,45 @@ final class TerminalViewer {
             labels[last.id] = nil; labels[merged.id] = Self.typeLabel(text)
             queue[queue.count - 1] = merged; return
         }
-        guard queue.count < 64 else { record("Input is busy; wait a moment", ok: false); return }
         let request = Request(action: action, arguments: arguments, timeout: 5)
+        enqueue(request, label: label)
+    }
+    func enqueue(_ request: Request, label: String) {
+        guard !guestOutcomeUnconfirmed else { return }
+        guard queue.count < 64 else { record("Input is busy; wait a moment", ok: false); return }
         labels[request.id] = label
         queue.append(request)
     }
-    private func sendNextInput() {
-        guard !inFlight, !queue.isEmpty else { return }
+    func sendNextInput() {
+        guard !guestOutcomeUnconfirmed, !inFlight, !queue.isEmpty else { return }
         let request = queue.removeFirst(), label = labels.removeValue(forKey: request.id) ?? request.action
         inFlight = true
         Task { @MainActor in
             let started = Date()
             do {
-                _ = try await mailbox.call(request)
+                try request.requireLive()
+                let custody = try GuestInputCustody.begin(directory: directory, mailbox: mailbox,
+                    request: request, claimedOwner: Self.leaseOwner)
+                try await custody.perform {
+                    if request.action == "clipboard-copy" {
+                        guard let revision = request.arguments["hostRevision"].flatMap(Int.init) else {
+                            throw OutcomeFailure("Missing clipboard ownership", outcome: .noEffect)
+                        }
+                        try await ClipboardBridge.copy(mailbox, request: request, expectedHostRevision: revision)
+                    }
+                    else { _ = try await mailbox.call(request) }
+                }
                 record(label, ok: true, milliseconds: Date().timeIntervalSince(started) * 1000)
             } catch {
-                queue.removeAll(); labels.removeAll()
-                record("\(label): \(error.localizedDescription)", ok: false)
+                // A known no-effect failure keeps the queued input in its original order; an
+                // unresolved outcome stops the queue instead of guessing what the guest did.
+                if InputQueue.disposition(for: error) == .stop {
+                    guestOutcomeUnconfirmed = true
+                    queue.removeAll(); labels.removeAll()
+                    record("\(label): \(error.localizedDescription) — queued input discarded", ok: false)
+                } else {
+                    record("\(label): \(error.localizedDescription)", ok: false)
+                }
             }
             inFlight = false
         }
@@ -472,7 +539,13 @@ final class TerminalViewer {
                 switch event {
                 case .text(let value):
                     if let shortcut = Self.shortcuts.first(where: { String($0.key) == value.lowercased() }) {
-                        enqueue("key", ["key": shortcut.chord], label: "\(shortcut.glyph) \(shortcut.label)")
+                        if shortcut.chord == "cmd+v" {
+                            do { enqueue(try ClipboardBridge.pasteRequest(), label: "Paste host text") }
+                            catch { record(error.localizedDescription, ok: false) }
+                        }
+                        else if shortcut.chord == "cmd+c" { enqueue("clipboard-copy", ["hostRevision": String(NSPasteboard.general.changeCount)], label: "Copy to host") }
+                        else if shortcut.chord == "guest-paste" { enqueue("key", ["key": "cmd+v"], label: "Paste guest clipboard") }
+                        else { enqueue("key", ["key": shortcut.chord], label: "\(shortcut.glyph) \(shortcut.label)") }
                     }
                     setPalette(false)
                 case .key, .mouse: setPalette(false)

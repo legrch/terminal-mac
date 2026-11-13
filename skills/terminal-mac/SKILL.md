@@ -24,17 +24,32 @@ Every command prints JSON and exits nonzero on failure. `NAME` defaults to `defa
 
 ```bash
 terminal-mac status NAME                     # stopped → terminal-mac start NAME
-terminal-mac action NAME status
-terminal-mac action NAME screenshot --output /tmp/guest.png   # then view the PNG
-terminal-mac action NAME click X Y [--double] [--button right]
-terminal-mac action NAME move X Y
-terminal-mac action NAME drag X Y X2 Y2
-terminal-mac action NAME type 'literal text'
-terminal-mac action NAME key cmd+space
-terminal-mac action NAME scroll --dy -300 --x X --y Y
+terminal-mac action --vm NAME status
+terminal-mac action --vm NAME screenshot --output /tmp/guest.png   # then view the PNG
+terminal-mac action --vm NAME click X Y [--double] [--button right]
+terminal-mac action --vm NAME move X Y
+terminal-mac action --vm NAME drag X Y X2 Y2
+terminal-mac action --vm NAME type 'literal text'
+terminal-mac action --vm NAME key cmd+space
+terminal-mac action --vm NAME scroll --dy -300 --x X --y Y
 ```
 
-Text is sent as Unicode keyboard events, not through the clipboard. No shell-execution action exists.
+`action --vm NAME ACTION` is the canonical form. The legacy `action NAME ACTION` spelling still
+works while unambiguous, but fails closed when the guest action verb (or the payload after
+`--text`) could be read as a VM name — pass `--vm` instead of guessing. Text is sent as Unicode
+keyboard events, not through the clipboard. No shell-execution action exists.
+
+Guest input uses a cooperative lease. While a viewer, an MCP agent or a scenario (for example a Farol test
+run) owns the guest, other clients are refused before anything is sent — the error names the
+holder. Check input custody with `terminal-mac lease NAME status`; do not work around a
+held lease or an `unresolved-predecessor` state. `held: false` alone is not permission to
+act when `inputAllowed` is false. Reconcile unresolved evidence before proceeding, without
+automatically deleting it. Long-running holders drive their own `action` calls with
+`--owner <their owner token>`. Renaming a stopped machine (identity, disks and guest data are
+preserved): `terminal-mac rename OLD NEW`. Cloning a stopped machine into an INDEPENDENT
+instance with a fresh VM identity and a copy-on-write disk: `terminal-mac clone OLD NEW`.
+Add `--offline` to disable the new instance's network without changing the base. This is a
+configuration choice, not evidence that a running guest's network isolation has been qualified.
 
 ## When to stop and ask the user
 

@@ -35,7 +35,10 @@ enum VirtualMachines {
             config.networkDevices = [network]
         }
         var shares: [String: VZSharedDirectory] = ["control": VZSharedDirectory(url: directory.appendingPathComponent("exchange"), readOnly: false)]
-        if let tools { shares["tools"] = VZSharedDirectory(url: tools, readOnly: true) }
+        if let tools {
+            shares["tools"] = VZSharedDirectory(url: tools, readOnly: true)
+            shares["artifacts"] = VZSharedDirectory(url: try ArtifactShareDirectory.prepare(in: directory), readOnly: true)
+        }
         let filesystem = VZVirtioFileSystemDeviceConfiguration(tag: VZVirtioFileSystemDeviceConfiguration.macOSGuestAutomountTag)
         filesystem.share = VZMultipleDirectoryShare(directories: shares)
         config.directorySharingDevices = [filesystem]
@@ -102,15 +105,27 @@ enum VirtualMachines {
 final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate {
     let vm: VZVirtualMachine
     let machine: Machine
+    let directory: URL
     let mailbox: Mailbox
+    let guestMailbox: Mailbox
     let lock: Int32
     var window: NSWindow?
     var loop: Task<Void, Never>?
+    let generation = UUID().uuidString.lowercased()
     var stopping = false
     var stopDeadline: Date?
+    /// Set when a requested guest shutdown has not powered off within the window.
+    /// macOS answers the virtual power button with its own confirmation dialog;
+    /// nothing confirms it automatically, so report the wait honestly.
+    var awaitingGuestConfirmation = false
+    /// The lease owner that deliberately showed the native window, so that owner's lease keeps
+    /// the window interactive (owner sign-in); a foreign holder makes it non-interactive.
+    var windowOwner: String?
 
     init(machine: Machine, directory: URL, tools: URL) throws {
         self.machine = machine
+        self.directory = directory
+        guestMailbox = try Mailbox(directory.appendingPathComponent("exchange"), create: true)
         lock = open(directory.appendingPathComponent("runtime.lock").path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard lock >= 0 else { throw Failure("Cannot open VM lock") }
         guard flock(lock, LOCK_EX | LOCK_NB) == 0 else { close(lock); throw Failure("VM is already running") }
@@ -129,8 +144,9 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
                 do { for request in try mailbox.requests() { await handle(request) } }
                 catch { stderr(error.localizedDescription) }
                 if let stopDeadline, Date() > stopDeadline {
-                    stderr("Guest shutdown is taking longer than 60 seconds. Use stop --force if needed.")
+                    stderr("Guest has not powered off within 60 seconds; macOS may be waiting at its shutdown confirmation. Use stop --confirm-guest-dialog or stop --force.")
                     self.stopDeadline = nil
+                    self.awaitingGuestConfirmation = true
                 }
                 try? await Task.sleep(nanoseconds: 100_000_000)
             }
@@ -139,10 +155,21 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
     func showWindow() {
         if let window { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
         NSApp.setActivationPolicy(.regular)
-        let view = VZVirtualMachineView(frame: NSRect(x: 0, y: 0, width: machine.width, height: machine.height))
+        let view = ClipboardMachineView(frame: NSRect(x: 0, y: 0, width: machine.width, height: machine.height))
+        view.clipboardMailbox = guestMailbox
+        view.clipboardCustody = NativeClipboardCustody(directory: directory)
         view.virtualMachine = vm
-        view.capturesSystemKeys = true
-        let window = NSWindow(contentRect: view.frame, styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
+        view.capturesSystemKeys = false
+        view.inputGate = { [weak self] in
+            guard let self else { return "an unavailable VM runtime" }
+            do {
+                let state = try InputLease.probe(directory: self.directory)
+                return InputLease.nativeWindowDenial(probe: state, windowOwner: self.windowOwner)
+            } catch {
+                return "an unavailable lease check (input refused)"
+            }
+        }
+        let window = ClipboardMachineWindow(contentRect: view.frame, styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
         window.title = "terminal-mac · \(machine.name)"
         window.contentView = view
         window.delegate = self
@@ -156,8 +183,18 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
         do {
             var values: [String: String] = [:]
             switch request.action {
-            case "status": values = ["name": machine.name, "state": stateName, "pid": String(getpid())]
-            case "show": showWindow()
+            case "status":
+                let shares = vm.directorySharingDevices.compactMap {
+                    ($0 as? VZVirtioFileSystemDevice)?.share as? VZMultipleDirectoryShare
+                }
+                let artifacts = shares.compactMap { $0.directories["artifacts"] }
+                let expected = directory.appendingPathComponent("artifacts").standardizedFileURL
+                let readOnly = artifacts.count == 1 && artifacts[0].isReadOnly && artifacts[0].url.standardizedFileURL == expected
+                values = ["name": machine.name, "state": stateName, "pid": String(getpid()), "generation": generation,
+                          "artifactShareReadOnly": String(readOnly), "artifactShareEvidence": "live-vz-configuration/1"]
+            case "show":
+                windowOwner = request.arguments["leaseOwner"]
+                showWindow()
             case "hide":
                 // Hiding the app hands focus back to whatever was in front before, usually the terminal.
                 window?.orderOut(nil); NSApp.hide(nil)
@@ -180,7 +217,8 @@ final class MachineRuntime: NSObject, VZVirtualMachineDelegate, NSWindowDelegate
     var stateName: String {
         switch vm.state {
         case .stopped: return "stopped"
-        case .running: return stopping ? "stopping" : "running"
+        case .running:
+            return stopping ? (awaitingGuestConfirmation ? GuestStopConfirmation.awaitingState : "stopping") : "running"
         case .paused: return "paused"
         case .starting: return "starting"
         case .pausing: return "pausing"

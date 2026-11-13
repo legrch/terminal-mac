@@ -8,10 +8,16 @@ fi
 configuration="${CONFIGURATION:-release}"
 source scripts/release-config.sh
 identity="${SIGN_IDENTITY:-}"
+# Optional: a dedicated build keychain holding the identity, kept out of the user's search list.
+keychain_args=()
+if [[ -n "${SIGN_KEYCHAIN:-}" ]]; then
+  [[ "$SIGN_KEYCHAIN" = /* && -f "$SIGN_KEYCHAIN" ]] || { echo 'SIGN_KEYCHAIN must be an existing absolute keychain path.' >&2; exit 1; }
+  keychain_args=(--keychain "$SIGN_KEYCHAIN")
+fi
 # A stable identity keeps the guest helper's Screen Recording and Accessibility approvals across
 # updates; ad-hoc signatures change with every build. SIGN_IDENTITY=- forces ad-hoc signing.
 if [[ -z "$identity" ]]; then
-  if security find-identity -p codesigning 2>/dev/null | grep -qF "\"$SIGNING_NAME\""; then identity="$SIGNING_NAME"
+  if security find-identity -p codesigning ${SIGN_KEYCHAIN:+"$SIGN_KEYCHAIN"} 2>/dev/null | grep -qF "\"$SIGNING_NAME\""; then identity="$SIGNING_NAME"
   else identity=-; echo "No \"$SIGNING_NAME\" identity; signing ad-hoc. Run scripts/create-signing-identity.sh to keep guest permissions across updates." >&2
   fi
 fi
@@ -30,7 +36,7 @@ case "$identity" in
 esac
 export CLANG_MODULE_CACHE_PATH="$PWD/.build/ModuleCache"
 export SWIFTPM_MODULECACHE_OVERRIDE="$CLANG_MODULE_CACHE_PATH"
-build_options=(--disable-sandbox --cache-path "$PWD/.build/cache" --config-path "$PWD/.build/configuration" --security-path "$PWD/.build/security")
+build_options=(--cache-path "$PWD/.build/cache" --config-path "$PWD/.build/configuration" --security-path "$PWD/.build/security")
 swift build "${build_options[@]}" -c "$configuration"
 binary_dir="$(swift build "${build_options[@]}" -c "$configuration" --show-bin-path)"
 app="$PWD/dist/TerminalMac.app"
@@ -59,8 +65,8 @@ cp -R skills/terminal-mac "$app/Contents/Resources/skills/"
 make_plist "$guest/Contents/Info.plist" dev.terminal-mac.guest TerminalMacGuest
 make_plist "$app/Contents/Info.plist" dev.terminal-mac.host TerminalMac
 # Guest has no Virtualization entitlement. Its guarded mode only controls the VM desktop.
-codesign --force --sign "$identity" "${sign_options[@]}" "$guest"
-codesign --force --sign "$identity" "${sign_options[@]}" --entitlements resources/terminal-mac.entitlements "$app"
+codesign --force ${keychain_args[@]+"${keychain_args[@]}"} --sign "$identity" "${sign_options[@]}" "$guest"
+codesign --force ${keychain_args[@]+"${keychain_args[@]}"} --sign "$identity" "${sign_options[@]}" --entitlements resources/terminal-mac.entitlements "$app"
 ln -sfn TerminalMac.app/Contents/MacOS/terminal-mac dist/terminal-mac
 codesign --verify --deep --strict "$app"
 echo "Built: $PWD/dist/terminal-mac"
