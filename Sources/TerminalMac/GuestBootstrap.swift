@@ -20,15 +20,35 @@ enum GuestBootstrap {
         }
         return lease
     }
-    static func installAndRelaunchIfNeeded() async throws -> Bool {
-        try GuestGuard.requireVirtualMac()
-        guard Bundle.main.bundleIdentifier == "dev.terminal-mac.guest" else { return false }
-        let source = Bundle.main.bundleURL.resolvingSymlinksInPath()
-        let identity = try CodeIdentity()
+    /// Host-visible, append-only record of helper install/update steps. Best
+    /// effort only: a failed log write never changes an install decision.
+    static let updateLogName = "guest-helper-update.log"
+    static func log(_ message: String) {
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let line = "\(stamp) pid=\(getpid()) build=\(build) \(message)\n"
+        stderr(line.trimmingCharacters(in: .newlines))
+        let url = URL(fileURLWithPath: "/Volumes/My Shared Files/control").appendingPathComponent(updateLogName)
+        let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        _ = line.withCString { write(fd, $0, strlen($0)) }
+    }
+
+    static var installedURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Applications").appendingPathComponent("TerminalMacGuest.app")
+    }
+
+    /// Installs `source` at the guest Applications location after validating its
+    /// signature against `identity`, then validates the staged copy again.
+    /// `except` is never asked to quit (the running helper updating itself).
+    static func install(from source: URL, identity: CodeIdentity,
+                        except: NSRunningApplication? = nil) async throws -> URL {
+        let destination = installedURL
+        let applications = destination.deletingLastPathComponent()
         try identity.validate(source)
-        let applications = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications")
-        let destination = applications.appendingPathComponent("TerminalMacGuest.app")
-        if source == destination.resolvingSymlinksInPath() { return false }
+        log("install: source validated \(source.path)")
         let updateLease = try serviceUpdateLease()
         defer { withExtendedLifetime(updateLease) {} }
         try FileManager.default.createDirectory(at: applications, withIntermediateDirectories: true)
@@ -37,53 +57,86 @@ enum GuestBootstrap {
         if exists, installed?.bundleIdentifier != "dev.terminal-mac.guest" {
             throw Failure("The guest install location is occupied by a different app: \(destination.path)")
         }
+        let incoming = Bundle(url: source)
         let keys = ["CFBundleVersion", "CFBundleShortVersionString"]
-        let needsUpdate = keys.contains { installed?.object(forInfoDictionaryKey: $0) as? String != Bundle.main.object(forInfoDictionaryKey: $0) as? String }
-        if !exists || needsUpdate {
-            let running = NSRunningApplication.runningApplications(withBundleIdentifier: "dev.terminal-mac.guest")
-                .filter { $0.bundleURL?.resolvingSymlinksInPath() == destination.resolvingSymlinksInPath() }
-            for application in running { _ = application.terminate() }
-            for _ in 0..<60 {
-                if running.allSatisfy({ $0.isTerminated }) { break }
-                try await Task.sleep(nanoseconds: 50_000_000)
-            }
-            guard running.allSatisfy({ $0.isTerminated }) else { throw Failure("Quit the installed guest helper, then reopen this copy to update it") }
-            let staging = applications.appendingPathComponent(".TerminalMacGuest-\(UUID().uuidString).app")
-            defer { try? FileManager.default.removeItem(at: staging) }
-            try FileManager.default.copyItem(at: source, to: staging)
-            try identity.validate(staging)
-            let backup = applications.appendingPathComponent(".TerminalMacGuest-backup-\(UUID().uuidString).app")
-            if exists { try FileManager.default.moveItem(at: destination, to: backup) }
-            do { try FileManager.default.moveItem(at: staging, to: destination) }
-            catch {
-                if exists { try? FileManager.default.moveItem(at: backup, to: destination) }
-                throw error
-            }
-            if exists { try? FileManager.default.removeItem(at: backup) }
+        let needsUpdate = keys.contains { installed?.object(forInfoDictionaryKey: $0) as? String != incoming?.object(forInfoDictionaryKey: $0) as? String }
+        guard !exists || needsUpdate else { log("install: already current"); return destination }
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: "dev.terminal-mac.guest")
+            .filter { $0.bundleURL?.resolvingSymlinksInPath() == destination.resolvingSymlinksInPath() && $0 != except }
+        for application in running { _ = application.terminate() }
+        for _ in 0..<60 {
+            if running.allSatisfy({ $0.isTerminated }) { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
         }
+        guard running.allSatisfy({ $0.isTerminated }) else {
+            log("install: refused, another installed helper did not quit")
+            throw Failure("Quit the installed guest helper, then reopen this copy to update it")
+        }
+        let staging = applications.appendingPathComponent(".TerminalMacGuest-\(UUID().uuidString).app")
+        defer { try? FileManager.default.removeItem(at: staging) }
+        try FileManager.default.copyItem(at: source, to: staging)
+        try identity.validate(staging)
+        let backup = applications.appendingPathComponent(".TerminalMacGuest-backup-\(UUID().uuidString).app")
+        if exists { try FileManager.default.moveItem(at: destination, to: backup) }
+        do { try FileManager.default.moveItem(at: staging, to: destination) }
+        catch {
+            if exists { try? FileManager.default.moveItem(at: backup, to: destination) }
+            log("install: swap failed \(error.localizedDescription)")
+            throw error
+        }
+        if exists { try? FileManager.default.removeItem(at: backup) }
+        log("install: installed \(destination.path)")
+        return destination
+    }
+
+    static func launchInstalled(_ destination: URL) async throws {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.createsNewApplicationInstance = true
         _ = try await NSWorkspace.shared.openApplication(at: destination, configuration: configuration)
-        return true
+        log("launch: opened \(destination.path)")
     }
-    /// The installed helper hands over to a newer copy in the shared tools folder, which installs
-    /// itself over this one and relaunches. Rebuilding terminal-mac on the host is enough to update the guest.
+
+    static func installAndRelaunchIfNeeded() async throws -> Bool {
+        try GuestGuard.requireVirtualMac()
+        guard Bundle.main.bundleIdentifier == "dev.terminal-mac.guest" else { return false }
+        let source = Bundle.main.bundleURL.resolvingSymlinksInPath()
+        if source == installedURL.resolvingSymlinksInPath() { return false }
+        log("explicit install from \(source.path)")
+        do {
+            let destination = try await install(from: source, identity: try CodeIdentity())
+            try await launchInstalled(destination)
+            return true
+        } catch { log("explicit install failed: \(error.localizedDescription)"); throw error }
+    }
+
+    /// The installed helper installs a newer copy from the shared tools folder
+    /// ITSELF (copy into Applications, validate, swap), launches the installed
+    /// copy and then quits. Nothing runs from the shared volume.
     static func updateFromSharedTools(_ tools: URL) {
         guard Bundle.main.bundleIdentifier == "dev.terminal-mac.guest",
-              !AppServiceFiles.hasUnresolved(in: GuestAppService.rootURL) else { return }
+              !AppServiceFiles.hasUnresolved(in: GuestAppService.rootURL),
+              !updating else { return }
         let shared = tools.appendingPathComponent("TerminalMacGuest.app")
         guard Bundle.main.bundleURL.resolvingSymlinksInPath() != shared.resolvingSymlinksInPath(),
               let available = Bundle(url: shared)?.object(forInfoDictionaryKey: "CFBundleVersion") as? String, let newer = Int(available),
               let running = Int(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""), newer > running else { return }
-        do { try CodeIdentity().validate(shared) }
-        catch { stderr("Guest helper update refused: \(error.localizedDescription)"); return }
-        stderr("Updating the guest helper from build \(running) to \(newer)…")
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.createsNewApplicationInstance = true
-        NSWorkspace.shared.openApplication(at: shared, configuration: configuration) { _, error in
-            if let error { stderr("Guest helper update: \(error.localizedDescription)") }
+        updating = true
+        log("update: build \(running) -> \(newer) from \(shared.path)")
+        Task { @MainActor in
+            do {
+                let identity = try CodeIdentity()
+                let destination = try await install(from: shared, identity: identity, except: NSRunningApplication.current)
+                try await launchInstalled(destination)
+                log("update: handed over, quitting build \(running)")
+                NSApp.terminate(nil)
+            } catch {
+                updating = false
+                log("update: refused or failed: \(error.localizedDescription)")
+            }
         }
     }
+    private static var updating = false
+
     static func registerForGuestLogin() {
         guard Bundle.main.bundleIdentifier == "dev.terminal-mac.guest" else { return }
         let preferences = UserDefaults.standard
