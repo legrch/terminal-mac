@@ -93,6 +93,7 @@ enum GuestBootstrap {
             .filter { $0.bundleURL?.resolvingSymlinksInPath() == destination.resolvingSymlinksInPath() &&
                       $0.processIdentifier != exceptPID }
         for application in running { _ = application.terminate() }
+        if !running.isEmpty { askedOthersToQuit = true }
         // An installed helper finishing its run loop can take seconds to quit; a
         // short wait refused the install AFTER the old helper had already been
         // asked to quit, leaving no helper running (observed with build 19 -> 20).
@@ -132,11 +133,16 @@ enum GuestBootstrap {
         let started = Date()
         var launched: NSRunningApplication?
         var failure: Error?
+        var abandoned = false
         NSWorkspace.shared.openApplication(at: destination, configuration: configuration) { app, error in
-            Task { @MainActor in launched = app; failure = error }
+            Task { @MainActor in
+                // A launch delivered after the timeout must not become a second helper.
+                if abandoned { if let app { _ = app.terminate(); log("launch: terminated late successor pid=\(app.processIdentifier)") }; return }
+                launched = app; failure = error
+            }
         }
         while launched == nil && failure == nil {
-            guard Date().timeIntervalSince(started) < timeout else { throw Failure("Helper launch timed out") }
+            guard Date().timeIntervalSince(started) < timeout else { abandoned = true; throw Failure("Helper launch timed out") }
             try await Task.sleep(nanoseconds: 100_000_000)
         }
         if let failure { throw failure }
@@ -170,7 +176,11 @@ enum GuestBootstrap {
         return others.allSatisfy { $0.isTerminated }
     }
     /// Best effort: make sure an installed helper runs after a failed explicit install.
+    /// Set once an install asked another installed helper to quit.
+    private static var askedOthersToQuit = false
     static func relaunchInstalledIfNoneRunning() async {
+        // Only an install that asked a helper to quit can have left none running.
+        guard askedOthersToQuit else { return }
         for _ in 0..<1200 {   // up to 60 s for a quitting helper to finish
             if instances(at: installedURL, except: getpid()).isEmpty { break }
             try? await Task.sleep(nanoseconds: 50_000_000)
