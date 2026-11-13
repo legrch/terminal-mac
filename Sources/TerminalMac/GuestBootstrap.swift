@@ -150,7 +150,7 @@ enum GuestBootstrap {
         NSWorkspace.shared.openApplication(at: destination, configuration: configuration) { app, error in
             Task { @MainActor in
                 // A launch delivered after the timeout must not become a second helper.
-                if abandoned { if let app { _ = app.terminate(); log("launch: terminated late successor pid=\(app.processIdentifier)") }; return }
+                if abandoned { if let app { await stopLateSuccessor(app) }; return }
                 launched = app; failure = error
             }
         }
@@ -172,6 +172,14 @@ enum GuestBootstrap {
         log("launch: running pid=\(app.processIdentifier) \(destination.path)")
     }
 
+    /// A successor delivered after the launch timeout served nothing; ask it to quit,
+    /// then force it after 5 s, since its run loop may never process the request.
+    static func stopLateSuccessor(_ app: NSRunningApplication) async {
+        _ = app.terminate()
+        for _ in 0..<100 where !app.exited { try? await Task.sleep(nanoseconds: 50_000_000) }
+        if !app.exited { _ = app.forceTerminate() }
+        log("launch: stopped late successor pid=\(app.processIdentifier) exited=\(app.exited)")
+    }
     static func instances(at destination: URL, except pid: pid_t) -> [NSRunningApplication] {
         NSRunningApplication.runningApplications(withBundleIdentifier: "dev.terminal-mac.guest").filter {
             $0.bundleURL?.resolvingSymlinksInPath() == destination.resolvingSymlinksInPath() && $0.processIdentifier != pid &&
