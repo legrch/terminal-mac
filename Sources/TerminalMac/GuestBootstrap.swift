@@ -57,11 +57,16 @@ enum GuestBootstrap {
             guard let backup else { return }
             let failed = destination.deletingLastPathComponent()
                 .appendingPathComponent(".TerminalMacGuest-failed-\(UUID().uuidString).app")
+            do { try FileManager.default.moveItem(at: destination, to: failed) }
+            catch { GuestBootstrap.log("restore: could not set aside \(destination.path): \(error.localizedDescription)"); return }
             do {
-                try FileManager.default.moveItem(at: destination, to: failed)
                 try FileManager.default.moveItem(at: backup, to: destination)
                 try? FileManager.default.removeItem(at: failed)
-            } catch { GuestBootstrap.log("restore failed: \(error.localizedDescription)") }
+            } catch {
+                // Never leave the installed location empty: put the new build back.
+                GuestBootstrap.log("restore: backup move failed (\(error.localizedDescription)); keeping \(failed.path)")
+                try? FileManager.default.moveItem(at: failed, to: destination)
+            }
         }
     }
 
@@ -91,8 +96,10 @@ enum GuestBootstrap {
         // An installed helper finishing its run loop can take seconds to quit; a
         // short wait refused the install AFTER the old helper had already been
         // asked to quit, leaving no helper running (observed with build 19 -> 20).
-        for _ in 0..<400 {
+        // Once asked to quit, wait for it (a helper mid hand-over can need ~35 s).
+        for tick in 0..<2400 {
             if running.allSatisfy({ $0.isTerminated }) { break }
+            if tick > 0, tick % 200 == 0 { log("install: waiting for \(running.filter { !$0.isTerminated }.count) helper(s) to quit") }
             try await Task.sleep(nanoseconds: 50_000_000)
         }
         log("install: \(running.count) other installed helper(s) quit=\(running.allSatisfy { $0.isTerminated })")
@@ -118,7 +125,8 @@ enum GuestBootstrap {
 
     /// Launches the installed copy and returns only once it is finished launching
     /// and still alive after a short grace period; otherwise throws (bounded).
-    static func launchInstalled(_ destination: URL, timeout: TimeInterval = 30) async throws {
+    static func launchInstalled(_ destination: URL, timeout: TimeInterval = 30,
+                                launched observe: (NSRunningApplication) -> Void = { _ in }) async throws {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.createsNewApplicationInstance = true
         let started = Date()
@@ -133,6 +141,7 @@ enum GuestBootstrap {
         }
         if let failure { throw failure }
         guard let app = launched else { throw Failure("Helper launch returned no application") }
+        observe(app)
         while !app.isFinishedLaunching {
             guard !app.isTerminated, Date().timeIntervalSince(started) < timeout else {
                 throw Failure("Helper did not finish launching")
@@ -144,6 +153,34 @@ enum GuestBootstrap {
         log("launch: running pid=\(app.processIdentifier) \(destination.path)")
     }
 
+    static func instances(at destination: URL, except pid: pid_t) -> [NSRunningApplication] {
+        NSRunningApplication.runningApplications(withBundleIdentifier: "dev.terminal-mac.guest").filter {
+            $0.bundleURL?.resolvingSymlinksInPath() == destination.resolvingSymlinksInPath() && $0.processIdentifier != pid
+        }
+    }
+    /// Stops instances started by a failed hand-over; true only when none survive.
+    static func stopFailedSuccessors(at destination: URL) async -> Bool {
+        let others = instances(at: destination, except: getpid())
+        for app in others { _ = app.terminate() }
+        for tick in 0..<200 {
+            if others.allSatisfy({ $0.isTerminated }) { return true }
+            if tick == 100 { for app in others where !app.isTerminated { _ = app.forceTerminate() } }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return others.allSatisfy { $0.isTerminated }
+    }
+    /// Best effort: make sure an installed helper runs after a failed explicit install.
+    static func relaunchInstalledIfNoneRunning() async {
+        for _ in 0..<1200 {   // up to 60 s for a quitting helper to finish
+            if instances(at: installedURL, except: getpid()).isEmpty { break }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        guard instances(at: installedURL, except: getpid()).isEmpty,
+              FileManager.default.fileExists(atPath: installedURL.path) else { return }
+        do { try await launchInstalled(installedURL); log("recovery: relaunched installed helper") }
+        catch { log("recovery: relaunch failed: \(error.localizedDescription)") }
+    }
+
     static func installAndRelaunchIfNeeded() async throws -> Bool {
         try GuestGuard.requireVirtualMac()
         guard Bundle.main.bundleIdentifier == "dev.terminal-mac.guest" else { return false }
@@ -151,9 +188,16 @@ enum GuestBootstrap {
         if source == installedURL.resolvingSymlinksInPath() { return false }
         log("explicit install from \(source.path)")
         do {
-            let installed = try await install(from: source, identity: try CodeIdentity())
+            let installed: Installed
+            do { installed = try await install(from: source, identity: try CodeIdentity()) }
+            catch { await relaunchInstalledIfNoneRunning(); throw error }
             do { try await launchInstalled(installed.destination) }
-            catch { installed.restore(); throw error }
+            catch {
+                _ = await stopFailedSuccessors(at: installed.destination)
+                installed.restore()
+                await relaunchInstalledIfNoneRunning()
+                throw error
+            }
             installed.discardBackup()
             withExtendedLifetime(installed.lease) {}
             return true
@@ -186,10 +230,17 @@ enum GuestBootstrap {
                 log("update: handed over, quitting build \(running)")
                 withExtendedLifetime(installed!.lease) { NSApp.terminate(nil) }
             } catch {
-                installed?.restore()
+                log("update: refused or failed: \(error.localizedDescription)")
+                if let installed {
+                    // Never run two helpers: resume only once every successor is gone.
+                    guard await stopFailedSuccessors(at: installed.destination) else {
+                        log("update: a successor could not be stopped; this helper stays paused")
+                        return
+                    }
+                    installed.restore()
+                }
                 handingOver = false
                 updating = false
-                log("update: refused or failed: \(error.localizedDescription)")
             }
         }
     }
