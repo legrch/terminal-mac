@@ -244,7 +244,9 @@ enum GuestBootstrap {
                 try await launchInstalled(installed!.destination)
                 installed!.discardBackup()
                 log("update: handed over, quitting build \(running)")
-                withExtendedLifetime(installed!.lease) { NSApp.terminate(nil) }
+                // The helper's own run loop may never process NSApp.terminate; exit
+                // directly once the successor is confirmed (the lease ends with us).
+                withExtendedLifetime(installed!.lease) { exit(0) }
             } catch {
                 log("update: refused or failed: \(error.localizedDescription)")
                 if let installed {
