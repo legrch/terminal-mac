@@ -97,10 +97,16 @@ enum GuestBootstrap {
         // An installed helper finishing its run loop can take seconds to quit; a
         // short wait refused the install AFTER the old helper had already been
         // asked to quit, leaving no helper running (observed with build 19 -> 20).
-        // Once asked to quit, wait for it (a helper mid hand-over can need ~35 s).
-        for tick in 0..<2400 {
+        // The helper runs its own loop, so a polite quit request may never be
+        // processed (live log: still running after 120 s). The update lease and
+        // custody checks above already prove no service or input is in flight,
+        // so after a grace period the old helper is stopped forcibly.
+        for tick in 0..<800 {
             if running.allSatisfy({ $0.isTerminated }) { break }
-            if tick > 0, tick % 200 == 0 { log("install: waiting for \(running.filter { !$0.isTerminated }.count) helper(s) to quit") }
+            if tick == 200 {
+                for application in running where !application.isTerminated { _ = application.forceTerminate() }
+                log("install: forced \(running.filter { !$0.isTerminated }.count) helper(s) that ignored quit")
+            }
             try await Task.sleep(nanoseconds: 50_000_000)
         }
         log("install: \(running.count) other installed helper(s) quit=\(running.allSatisfy { $0.isTerminated })")
