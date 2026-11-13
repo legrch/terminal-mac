@@ -70,7 +70,8 @@ final class GuestRuntime: NSObject {
             while let self, !Task.isCancelled {
                 self.label?.stringValue = self.permissionStatus
                 do {
-                    for request in try mailbox.requests() {
+                    // Paused during a helper hand-over: requests stay queued for the successor.
+                    for request in (GuestBootstrap.handingOver ? [] : try mailbox.requests()) {
                         lastRequest = Date()
                         // Live frames long-poll for changes; input must never wait behind them.
                         if request.arguments["format"] == "bgra-lz4" { Task { await self.handle(request) } }

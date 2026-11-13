@@ -22,8 +22,8 @@ enum GuestBootstrap {
     }
     /// Host-visible, append-only record of helper install/update steps. Best
     /// effort only: a failed log write never changes an install decision.
-    static let updateLogName = "guest-helper-update.log"
-    static func log(_ message: String) {
+    nonisolated static let updateLogName = "guest-helper-update.log"
+    nonisolated static func log(_ message: String) {
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
         let stamp = ISO8601DateFormatter().string(from: Date())
         let line = "\(stamp) pid=\(getpid()) build=\(build) \(message)\n"
@@ -32,6 +32,8 @@ enum GuestBootstrap {
         let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard fd >= 0 else { return }
         defer { close(fd) }
+        var info = stat()
+        if fstat(fd, &info) == 0, info.st_size > 262_144 { _ = ftruncate(fd, 0) }  // bounded log
         _ = line.withCString { write(fd, $0, strlen($0)) }
     }
 
@@ -43,14 +45,33 @@ enum GuestBootstrap {
     /// Installs `source` at the guest Applications location after validating its
     /// signature against `identity`, then validates the staged copy again.
     /// `except` is never asked to quit (the running helper updating itself).
+    struct Installed {
+        let destination: URL
+        /// Held until the caller finishes its hand-over; released on drop.
+        let lease: AppServiceLock
+        /// The previous bundle, kept until the successor is confirmed.
+        let backup: URL?
+        func discardBackup() { if let backup { try? FileManager.default.removeItem(at: backup) } }
+        /// Put the previous bundle back after a failed hand-over.
+        func restore() {
+            guard let backup else { return }
+            let failed = destination.deletingLastPathComponent()
+                .appendingPathComponent(".TerminalMacGuest-failed-\(UUID().uuidString).app")
+            do {
+                try FileManager.default.moveItem(at: destination, to: failed)
+                try FileManager.default.moveItem(at: backup, to: destination)
+                try? FileManager.default.removeItem(at: failed)
+            } catch { GuestBootstrap.log("restore failed: \(error.localizedDescription)") }
+        }
+    }
+
     static func install(from source: URL, identity: CodeIdentity,
-                        except: NSRunningApplication? = nil) async throws -> URL {
+                        exceptPID: pid_t? = nil) async throws -> Installed {
         let destination = installedURL
         let applications = destination.deletingLastPathComponent()
         try identity.validate(source)
         log("install: source validated \(source.path)")
         let updateLease = try serviceUpdateLease()
-        defer { withExtendedLifetime(updateLease) {} }
         try FileManager.default.createDirectory(at: applications, withIntermediateDirectories: true)
         let installed = Bundle(url: destination)
         let exists = FileManager.default.fileExists(atPath: destination.path)
@@ -60,14 +81,21 @@ enum GuestBootstrap {
         let incoming = Bundle(url: source)
         let keys = ["CFBundleVersion", "CFBundleShortVersionString"]
         let needsUpdate = keys.contains { installed?.object(forInfoDictionaryKey: $0) as? String != incoming?.object(forInfoDictionaryKey: $0) as? String }
-        guard !exists || needsUpdate else { log("install: already current"); return destination }
+        guard !exists || needsUpdate else {
+            log("install: already current"); return Installed(destination: destination, lease: updateLease, backup: nil)
+        }
         let running = NSRunningApplication.runningApplications(withBundleIdentifier: "dev.terminal-mac.guest")
-            .filter { $0.bundleURL?.resolvingSymlinksInPath() == destination.resolvingSymlinksInPath() && $0 != except }
+            .filter { $0.bundleURL?.resolvingSymlinksInPath() == destination.resolvingSymlinksInPath() &&
+                      $0.processIdentifier != exceptPID }
         for application in running { _ = application.terminate() }
-        for _ in 0..<60 {
+        // An installed helper finishing its run loop can take seconds to quit; a
+        // short wait refused the install AFTER the old helper had already been
+        // asked to quit, leaving no helper running (observed with build 19 -> 20).
+        for _ in 0..<400 {
             if running.allSatisfy({ $0.isTerminated }) { break }
             try await Task.sleep(nanoseconds: 50_000_000)
         }
+        log("install: \(running.count) other installed helper(s) quit=\(running.allSatisfy { $0.isTerminated })")
         guard running.allSatisfy({ $0.isTerminated }) else {
             log("install: refused, another installed helper did not quit")
             throw Failure("Quit the installed guest helper, then reopen this copy to update it")
@@ -84,16 +112,36 @@ enum GuestBootstrap {
             log("install: swap failed \(error.localizedDescription)")
             throw error
         }
-        if exists { try? FileManager.default.removeItem(at: backup) }
         log("install: installed \(destination.path)")
-        return destination
+        return Installed(destination: destination, lease: updateLease, backup: exists ? backup : nil)
     }
 
-    static func launchInstalled(_ destination: URL) async throws {
+    /// Launches the installed copy and returns only once it is finished launching
+    /// and still alive after a short grace period; otherwise throws (bounded).
+    static func launchInstalled(_ destination: URL, timeout: TimeInterval = 30) async throws {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.createsNewApplicationInstance = true
-        _ = try await NSWorkspace.shared.openApplication(at: destination, configuration: configuration)
-        log("launch: opened \(destination.path)")
+        let started = Date()
+        var launched: NSRunningApplication?
+        var failure: Error?
+        NSWorkspace.shared.openApplication(at: destination, configuration: configuration) { app, error in
+            Task { @MainActor in launched = app; failure = error }
+        }
+        while launched == nil && failure == nil {
+            guard Date().timeIntervalSince(started) < timeout else { throw Failure("Helper launch timed out") }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        if let failure { throw failure }
+        guard let app = launched else { throw Failure("Helper launch returned no application") }
+        while !app.isFinishedLaunching {
+            guard !app.isTerminated, Date().timeIntervalSince(started) < timeout else {
+                throw Failure("Helper did not finish launching")
+            }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        try await Task.sleep(nanoseconds: 2_000_000_000)
+        guard !app.isTerminated else { throw Failure("Helper exited right after launch") }
+        log("launch: running pid=\(app.processIdentifier) \(destination.path)")
     }
 
     static func installAndRelaunchIfNeeded() async throws -> Bool {
@@ -103,8 +151,11 @@ enum GuestBootstrap {
         if source == installedURL.resolvingSymlinksInPath() { return false }
         log("explicit install from \(source.path)")
         do {
-            let destination = try await install(from: source, identity: try CodeIdentity())
-            try await launchInstalled(destination)
+            let installed = try await install(from: source, identity: try CodeIdentity())
+            do { try await launchInstalled(installed.destination) }
+            catch { installed.restore(); throw error }
+            installed.discardBackup()
+            withExtendedLifetime(installed.lease) {}
             return true
         } catch { log("explicit install failed: \(error.localizedDescription)"); throw error }
     }
@@ -123,19 +174,28 @@ enum GuestBootstrap {
         updating = true
         log("update: build \(running) -> \(newer) from \(shared.path)")
         Task { @MainActor in
+            var installed: Installed?
             do {
                 let identity = try CodeIdentity()
-                let destination = try await install(from: shared, identity: identity, except: NSRunningApplication.current)
-                try await launchInstalled(destination)
+                installed = try await install(from: shared, identity: identity, exceptPID: getpid())
+                // From here this process admits no new requests: the lease stays
+                // held and the successor alone serves the mailbox once confirmed.
+                handingOver = true
+                try await launchInstalled(installed!.destination)
+                installed!.discardBackup()
                 log("update: handed over, quitting build \(running)")
-                NSApp.terminate(nil)
+                withExtendedLifetime(installed!.lease) { NSApp.terminate(nil) }
             } catch {
+                installed?.restore()
+                handingOver = false
                 updating = false
                 log("update: refused or failed: \(error.localizedDescription)")
             }
         }
     }
     private static var updating = false
+    /// True while this helper hands over to its successor; the request loop pauses.
+    static private(set) var handingOver = false
 
     static func registerForGuestLogin() {
         guard Bundle.main.bundleIdentifier == "dev.terminal-mac.guest" else { return }
